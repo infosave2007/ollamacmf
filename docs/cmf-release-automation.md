@@ -33,8 +33,8 @@ Merging updates what new builds of `ollamacmf` download and bundle. Existing ins
 Tag the merged commit and push the tag. The [release workflow](cmf-engine.md#releases) builds the binaries with the new runtime bundled and publishes them.
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag cmf-v0.2.0
+git push origin cmf-v0.2.0
 ```
 
 ## Manual lock updates

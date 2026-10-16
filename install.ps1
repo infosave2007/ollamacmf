@@ -5,7 +5,7 @@
 # Downloads the latest release archive, verifies its SHA-256 against the
 # published checksums, installs ollamacmf.exe and the bundled Cortiq runtime
 # into %LOCALAPPDATA%\Programs\ollamacmf, and adds that directory to the
-# user's PATH. Set $env:OLLAMACMF_VERSION = 'v0.1.0' to pin a release.
+# user's PATH. Set $env:OLLAMACMF_VERSION = 'cmf-v0.1.0' to pin a release.
 $ErrorActionPreference = 'Stop'
 
 $repo = if ($env:OLLAMACMF_REPO) { $env:OLLAMACMF_REPO } else { 'infosave2007/ollamacmf' }

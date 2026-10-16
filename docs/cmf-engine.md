@@ -47,15 +47,15 @@ Updating the lock is described in [runtime updates](cmf-release-automation.md). 
 
 ## Releases
 
-`.github/workflows/release-ollamacmf.yml` runs on every `v*` tag. It builds `ollamacmf` with `go build` on native runners for macOS (arm64 and amd64), Linux (amd64 and arm64) and Windows amd64, downloads and verifies the Cortiq archive for each target from the lock, and publishes `ollamacmf-<os>-<arch>.tar.gz` or `.zip` plus `checksums.txt` on a GitHub release. `install.sh` and `install.ps1` download from exactly those assets.
+`.github/workflows/release-ollamacmf.yml` runs on every `cmf-v*` tag (the `cmf-` prefix keeps fork releases apart from the inherited upstream Ollama tags). It builds `ollamacmf` with `go build` on native runners for macOS (arm64 and amd64), Linux (amd64 and arm64) and Windows amd64, downloads and verifies the Cortiq archive for each target from the lock, and publishes `ollamacmf-<os>-<arch>.tar.gz` or `.zip` plus `checksums.txt` on a GitHub release. `install.sh` and `install.ps1` download from exactly those assets.
 
 Upstream Ollama's `release.yaml` and `latest.yaml` are kept for reference but only run on manual dispatch: they need Ollama Inc.'s signing secrets and self-hosted runners.
 
 To cut a release:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag cmf-v0.2.0
+git push origin cmf-v0.2.0
 ```
 
 ## Tests

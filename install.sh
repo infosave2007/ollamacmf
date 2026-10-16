@@ -6,7 +6,7 @@
 # Downloads the latest release archive for this machine, verifies its SHA-256
 # against the published checksums, and installs `ollamacmf` plus the bundled
 # Cortiq runtime into /usr/local/bin (or ~/.local/bin when that is not
-# writable). Set OLLAMACMF_VERSION=v0.1.0 to pin a release, or
+# writable). Set OLLAMACMF_VERSION=cmf-v0.1.0 to pin a release, or
 # OLLAMACMF_INSTALL_DIR to choose the destination.
 set -eu
 

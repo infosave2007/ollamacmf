@@ -3,16 +3,18 @@ name: release-ollamacmf
 # Builds ollamacmf for every supported platform, bundles the pinned Cortiq
 # runtime next to it, and publishes the archives on a GitHub release.
 #
-# Trigger: push a tag such as v0.1.0. The tag becomes the release version.
+# Trigger: push a tag such as cmf-v0.1.0. The part after "cmf-v" becomes the
+# release version. The "cmf-" prefix keeps fork releases apart from the
+# upstream Ollama tags (v0.1.0, v0.2.0, ...) that this repository inherited.
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'cmf-v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to rebuild and publish (for example v0.1.0)'
+        description: 'Existing tag to rebuild and publish (for example cmf-v0.1.0)'
         required: true
         type: string
 
@@ -70,8 +72,10 @@ jobs:
         shell: bash
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#cmf-}"
+          version="${version#v}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build ollamacmf
         shell: bash
@@ -181,12 +185,14 @@ jobs:
           ls -la
 
       - name: Release notes
+        id: notes
         shell: bash
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#cmf-}"
           cortiq="$(jq -r '.upstream.release.tag' cmfrunner/cmf.lock.json)"
           cat > notes.md <<EOF
-          ## ollamacmf $tag
+          ## ollamacmf $version
 
           Ollama with native support for CMF models. Each archive contains the
           \`ollamacmf\` binary and the Cortiq $cortiq runtime for that platform.
@@ -216,12 +222,13 @@ jobs:
 
           See the [README](https://github.com/${{ github.repository }}#readme) for details.
           EOF
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          name: ollamacmf ${{ inputs.tag || github.ref_name }}
+          name: ollamacmf ${{ steps.notes.outputs.version }}
           body_path: notes.md
           files: |
             dist/*.tar.gz
