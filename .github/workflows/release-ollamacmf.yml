@@ -1,0 +1,229 @@
+name: release-ollamacmf
+
+# Builds ollamacmf for every supported platform, bundles the pinned Cortiq
+# runtime next to it, and publishes the archives on a GitHub release.
+#
+# Trigger: push a tag such as v0.1.0. The tag becomes the release version.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to rebuild and publish (for example v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-ollamacmf-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CGO_ENABLED: '1'
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-15
+            goos: darwin
+            goarch: arm64
+          - target: darwin-amd64
+            os: macos-15
+            goos: darwin
+            goarch: amd64
+          - target: linux-amd64
+            os: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - target: windows-amd64
+            os: windows-2022
+            goos: windows
+            goarch: amd64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build ollamacmf
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          exe=ollamacmf
+          [ "$GOOS" = windows ] && exe=ollamacmf.exe
+          mkdir -p dist/stage
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/ollama/ollama/version.Version=${{ steps.version.outputs.version }} -X github.com/ollama/ollama/server.mode=release" \
+            -o "dist/stage/$exe" .
+          "dist/stage/$exe" --version || true
+
+      - name: Bundle the pinned Cortiq runtime
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.goos }}/${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          lock=cmfrunner/cmf.lock.json
+          asset="$(jq -c --arg p "$PLATFORM" '.artifacts[] | select(.platform == $p)' "$lock")"
+          if [ -z "$asset" ]; then
+            echo "No Cortiq build is published for $PLATFORM; the archive ships without a bundled runtime." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          url="$(jq -r '.archive.url' <<<"$asset")"
+          sha="$(jq -r '.archive.sha256' <<<"$asset")"
+          format="$(jq -r '.archive.format' <<<"$asset")"
+          entry="$(jq -r '.archive.entries[0]' <<<"$asset")"
+          curl -fsSL --retry 4 -o runtime.archive "$url"
+          if command -v sha256sum >/dev/null; then
+            echo "$sha  runtime.archive" | sha256sum -c -
+          else
+            echo "$sha  runtime.archive" | shasum -a 256 -c -
+          fi
+          case "$format" in
+            tar.gz) tar -xzf runtime.archive -C dist/stage "$entry" ;;
+            zip)
+              if command -v unzip >/dev/null; then
+                unzip -o -q runtime.archive "$entry" -d dist/stage
+              else
+                7z x -y -o"dist/stage" runtime.archive "$entry" >/dev/null
+              fi
+              ;;
+            *) echo "unsupported archive format $format" >&2; exit 1 ;;
+          esac
+          chmod +x "dist/stage/$entry" || true
+          cat > dist/stage/CORTIQ-NOTICE.txt <<EOF
+          This archive bundles the Cortiq runtime $(jq -r '.upstream.release.tag' "$lock")
+          from https://github.com/$(jq -r '.upstream.repository' "$lock"),
+          distributed under the $(jq -r '.upstream.license' "$lock") license.
+          EOF
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp LICENSE dist/stage/LICENSE
+          name="ollamacmf-${{ matrix.target }}"
+          cd dist/stage
+          if [ "${{ matrix.goos }}" = windows ]; then
+            archive="$name.zip"
+            7z a -tzip "../$archive" . >/dev/null
+          else
+            archive="$name.tar.gz"
+            tar -czf "../$archive" .
+          fi
+          cd ..
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        shell: bash
+        run: |
+          cd dist
+          cat ./*.sha256 > checksums.txt
+          rm ./*.sha256
+          ls -la
+
+      - name: Release notes
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          cortiq="$(jq -r '.upstream.release.tag' cmfrunner/cmf.lock.json)"
+          cat > notes.md <<EOF
+          ## ollamacmf $tag
+
+          Ollama with native support for CMF models. Each archive contains the
+          \`ollamacmf\` binary and the Cortiq $cortiq runtime for that platform.
+
+          ### Install
+
+          macOS / Linux:
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+          \`\`\`
+
+          Windows (PowerShell):
+
+          \`\`\`powershell
+          irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
+          \`\`\`
+
+          Or download the archive for your platform below, unpack it, and run \`ollamacmf serve\`.
+
+          ### Quick start
+
+          \`\`\`sh
+          ollamacmf serve
+          ollamacmf run hf.co/infosave/LFM2.5-cmf:lfm2.5-230m-q4tp
+          \`\`\`
+
+          See the [README](https://github.com/${{ github.repository }}#readme) for details.
+          EOF
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ollamacmf ${{ inputs.tag || github.ref_name }}
+          body_path: notes.md
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt

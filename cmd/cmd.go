@@ -384,12 +384,19 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 		return errForceLocalOnly
 	}
 
+	return createFromModelfile(cmd, modelName, modelfile, filepath.Dir(filename), draftQuantize, p)
+}
+
+// createFromModelfile uploads the files a Modelfile references and asks the
+// server to create modelName from it.
+func createFromModelfile(cmd *cobra.Command, modelName string, modelfile *parser.Modelfile, dir, draftQuantize string, p *progress.Progress) error {
+	args := []string{modelName}
 	// Standard Modelfile + API path
 	status := "gathering model components"
 	spinner := progress.NewSpinner(status)
 	p.Add(status, spinner)
 
-	req, err := modelfile.CreateRequest(filepath.Dir(filename))
+	req, err := modelfile.CreateRequest(dir)
 	if err != nil {
 		return err
 	}
@@ -944,6 +951,15 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	insecure, err := cmd.Flags().GetBool("insecure")
 	if err != nil {
 		return err
+	}
+
+	if isCMFFileArgument(args[0]) {
+		imported, err := importCMFFile(cmd, args[0], "", "")
+		if err != nil {
+			return err
+		}
+		args[0] = imported
+		opts.Model = imported
 	}
 
 	info, name, err := showOrPullModel(cmd, client, args[0], opts.Runner, insecure, "run")
@@ -2501,8 +2517,8 @@ func NewCLI() *cobra.Command {
 	}
 
 	rootCmd := &cobra.Command{
-		Use:           "ollama",
-		Short:         "Large language model runner",
+		Use:           cliName(),
+		Short:         "Large language model runner with CMF support",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		CompletionOptions: cobra.CompletionOptions{
@@ -2559,7 +2575,7 @@ func NewCLI() *cobra.Command {
 	showCmd.Flags().BoolP("verbose", "v", false, "Show detailed model information")
 
 	runCmd := &cobra.Command{
-		Use:   "run MODEL [PROMPT]",
+		Use:   "run MODEL|FILE.cmf [PROMPT]",
 		Short: "Run a model",
 		Example: `  ollama run gemma4
   ollama run gemma4 "Why is the sky blue?"
@@ -2611,7 +2627,7 @@ func NewCLI() *cobra.Command {
 
 	pullCmd := &cobra.Command{
 		Use:     "pull MODEL",
-		Short:   "Pull a model from a registry",
+		Short:   "Pull a model from a registry or a CMF model from Hugging Face (hf.co/user/repo:file)",
 		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    PullHandler,
@@ -2782,12 +2798,23 @@ func NewCLI() *cobra.Command {
 		psCmd,
 		copyCmd,
 		deleteCmd,
+		cmfCommand(),
 		runnerCmd,
 		gpuDiscoverCmd,
 		launch.LaunchCmd(checkServerHeartbeat, runInteractiveTUI),
 	)
 
 	return rootCmd
+}
+
+// cliName is the name this binary was invoked as, so help text matches the
+// installed command ("ollamacmf" by default, "ollama" for a plain build).
+func cliName() string {
+	name := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
+	if name == "" || name == "." || strings.HasPrefix(name, "__debug") || strings.HasSuffix(name, ".test") {
+		return "ollama"
+	}
+	return name
 }
 
 // If the user has explicitly set thinking options, either through the CLI or

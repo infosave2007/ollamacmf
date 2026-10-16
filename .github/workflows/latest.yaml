@@ -1,8 +1,8 @@
 name: latest
 
+# Upstream Docker Hub tagging; not used by this fork.
 on:
-  release:
-    types: [released]
+  workflow_dispatch:
 
 jobs:
   update-latest:

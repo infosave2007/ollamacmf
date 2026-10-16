@@ -339,6 +339,9 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_CREATE_REMOTE":        {"OLLAMA_CREATE_REMOTE", CreateRemote(), "Force model creation through the server API even when the server is local"},
 		"OLLAMA_EDITOR":               {"OLLAMA_EDITOR", Editor(), "Path to editor for interactive prompt editing (Ctrl+G)"},
 		"OLLAMA_REMOTES":              {"OLLAMA_REMOTES", Remotes(), "Allowed hosts for remote models (default \"ollama.com\")"},
+		"OLLAMA_CORTIQ_PATH":          {"OLLAMA_CORTIQ_PATH", String("OLLAMA_CORTIQ_PATH")(), "Use this Cortiq executable for CMF models instead of the managed one"},
+		"OLLAMA_CORTIQ_DIR":           {"OLLAMA_CORTIQ_DIR", String("OLLAMA_CORTIQ_DIR")(), "Directory the Cortiq runtime is installed into (default: next to OLLAMA_MODELS)"},
+		"OLLAMA_CORTIQ_AUTO_INSTALL":  {"OLLAMA_CORTIQ_AUTO_INSTALL", BoolWithDefault("OLLAMA_CORTIQ_AUTO_INSTALL")(true), "Download the pinned Cortiq runtime automatically when it is missing (default true)"},
 
 		// Informational
 		"HTTP_PROXY":  {"HTTP_PROXY", String("HTTP_PROXY")(), "HTTP proxy"},

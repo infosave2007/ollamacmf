@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/cmfrunner"
 	"github.com/ollama/ollama/fs/gguf"
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/template"
@@ -20,7 +21,8 @@ import (
 type modelLayer struct {
 	manifest.Layer
 	GGUF           *gguf.Metadata
-	CMF            bool // true when this layer is an opaque CMF model blob
+	CMF            bool            // true when this layer is a CMF model blob
+	CMFInfo        *cmfrunner.Info // header metadata of a freshly imported CMF blob
 	parameterCount uint64
 	splitFile      string
 	splitLayers    []manifest.Layer

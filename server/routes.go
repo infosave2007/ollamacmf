@@ -143,14 +143,6 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 		opts.NumCtx = s.defaultNumCtx
 	}
 
-	if model != nil && model.IsCMF() {
-		for _, optionMap := range []map[string]any{model.GenerationDefaults, model.Options, requestOpts} {
-			if err := validateCMFOptionMap(optionMap); err != nil {
-				return api.Options{}, err
-			}
-		}
-	}
-
 	// api.Options stores defaulted values, so lower layers cannot distinguish
 	// an unset draft_num_predict from the default. Track that while we still
 	// have the raw model/request option maps.
@@ -186,35 +178,6 @@ func cmfOptionParseError(model *Model, err error) error {
 		return api.StatusError{StatusCode: http.StatusBadRequest, ErrorMessage: err.Error()}
 	}
 	return err
-}
-
-// CMF's public Cortiq protocol currently exposes only these request controls.
-// In particular it cannot honor Ollama runner knobs such as num_gpu, num_ctx,
-// num_batch, num_thread, use_mmap, or draft_num_predict. Validate raw maps
-// before scheduling so a request cannot start an unusable sidecar and then
-// silently ignore the caller's requested resources.
-var cmfSupportedOptionKeys = map[string]struct{}{
-	"temperature": {},
-	"top_p":       {},
-	"seed":        {},
-	"num_predict": {},
-}
-
-func validateCMFOptionMap(options map[string]any) error {
-	var unsupported []string
-	for key := range options {
-		if _, ok := cmfSupportedOptionKeys[key]; !ok {
-			unsupported = append(unsupported, key)
-		}
-	}
-	if len(unsupported) == 0 {
-		return nil
-	}
-	slices.Sort(unsupported)
-	return api.StatusError{
-		StatusCode:   http.StatusBadRequest,
-		ErrorMessage: fmt.Sprintf("CMF does not support option(s): %s", strings.Join(unsupported, ", ")),
-	}
 }
 
 func shouldApplyEmbeddingBatchDefault(m *Model, requestOpts map[string]any) bool {
@@ -549,17 +512,6 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		if message := cmfGenerateRequestError(m, req); message != "" {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": message})
 			return
-		}
-		if req.Raw {
-			if err := validateCMFRawCompletionOptionMaps(m, req.Options); err != nil {
-				var statusErr api.StatusError
-				if errors.As(err, &statusErr) {
-					c.AbortWithStatusJSON(statusErr.StatusCode, gin.H{"error": statusErr.ErrorMessage})
-					return
-				}
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
 		}
 	}
 
@@ -980,9 +932,6 @@ func cmfGenerateRequestError(m *Model, req api.GenerateRequest) string {
 	if message := cmfOutputRequestError(req.Format, req.Logprobs, req.TopLogprobs); message != "" {
 		return message
 	}
-	if message := cmfContextControlError(req.Truncate, req.Shift); message != "" {
-		return message
-	}
 	switch {
 	case m != nil && cmfMessagesContainImages(m.Messages):
 		// Create rejects this for new CMF models, but keep generation safe for
@@ -1013,56 +962,6 @@ func cmfOutputRequestError(format json.RawMessage, logprobs bool, topLogprobs in
 		return "CMF models do not support log probabilities"
 	}
 	return ""
-}
-
-// cmfContextControlError rejects caller-supplied context controls rather than
-// pretending Cortiq applied Ollama's token-accurate truncation or shifting.
-// Nil keeps the ordinary API default, which this adapter documents as owned by
-// the CMF model/runtime rather than by Ollama.
-func cmfContextControlError(truncate, shift *bool) string {
-	var unsupported []string
-	if truncate != nil {
-		unsupported = append(unsupported, "truncate")
-	}
-	if shift != nil {
-		unsupported = append(unsupported, "shift")
-	}
-	if len(unsupported) == 0 {
-		return ""
-	}
-	return fmt.Sprintf("CMF models do not support explicit context control(s): %s", strings.Join(unsupported, ", "))
-}
-
-// validateCMFRawCompletionOptionMaps sees the maps before api.Options applies
-// defaults. Completion only has Cortiq's temperature/max_tokens mapping, so
-// even an explicitly supplied value equal to an Ollama default must be
-// rejected instead of silently omitting it from the sidecar request.
-func validateCMFRawCompletionOptionMaps(m *Model, requestOpts map[string]any) error {
-	var unsupported []string
-	seen := make(map[string]struct{})
-	optionMaps := []map[string]any{requestOpts}
-	if m != nil {
-		optionMaps = append([]map[string]any{m.GenerationDefaults, m.Options}, optionMaps...)
-	}
-	for _, options := range optionMaps {
-		for _, key := range []string{"top_p", "seed"} {
-			if _, ok := options[key]; ok {
-				seen[key] = struct{}{}
-			}
-		}
-	}
-	for _, key := range []string{"top_p", "seed"} {
-		if _, ok := seen[key]; ok {
-			unsupported = append(unsupported, key)
-		}
-	}
-	if len(unsupported) == 0 {
-		return nil
-	}
-	return api.StatusError{
-		StatusCode:   http.StatusBadRequest,
-		ErrorMessage: fmt.Sprintf("CMF raw generation does not support option(s): %s", strings.Join(unsupported, ", ")),
-	}
 }
 
 func writeGenerateResponse(c *gin.Context, req api.GenerateRequest, ch <-chan any) {
@@ -2249,8 +2148,21 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 		return resp, nil
 	}
 
-	// CMF is an opaque runner-native format and has no GGUF metadata to show.
+	// CMF has no GGUF metadata; describe it from the header recorded at import.
 	if m.IsCMF() {
+		if arch := m.Config.ModelFamily; arch != "" {
+			resp.ModelInfo["general.architecture"] = arch
+			if m.Config.BaseName != "" {
+				resp.ModelInfo["general.basename"] = m.Config.BaseName
+			}
+			if m.Config.ContextLen > 0 {
+				resp.ModelInfo[arch+".context_length"] = m.Config.ContextLen
+			}
+			if m.Config.EmbedLen > 0 {
+				resp.ModelInfo[arch+".embedding_length"] = m.Config.EmbedLen
+			}
+		}
+		resp.ModelInfo["general.file_type"] = m.Config.FileType
 		return resp, nil
 	}
 
@@ -2608,6 +2520,8 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.HEAD("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
 	r.GET("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
 	r.GET("/api/status", s.StatusHandler)
+	r.GET("/api/cmf/status", s.CMFStatusHandler)
+	r.POST("/api/cmf/runtime/install", s.CMFRuntimeInstallHandler)
 	// Codex uses this existing Ollama listener for both native and Ollama
 	// models. The proxy selects the upstream per request.
 	r.Any(proxy.CodexDesktopPathPrefix+"/*path", gin.WrapH(codexDesktopProxy))
@@ -2815,7 +2729,7 @@ func Serve(ln net.Listener) error {
 // non-streamed requests can still carry the HTTP status.
 func registryOperationError(err error) gin.H {
 	response := gin.H{"error": err.Error()}
-	if errors.Is(err, errCMFRemotePull) || errors.Is(err, errCMFRegistryPush) {
+	if errors.Is(err, errCMFRegistryPush) || errors.Is(err, errCMFPullNotFound) || errors.Is(err, errCMFPullAmbiguous) || errors.Is(err, errInvalidCMF) {
 		response["status"] = http.StatusBadRequest
 	}
 	return response
@@ -3422,10 +3336,6 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": message})
 			return
 		}
-		if message := cmfContextControlError(req.Truncate, req.Shift); message != "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": message})
-			return
-		}
 		if req.DebugRenderOnly {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "CMF models do not expose rendered prompts"})
 			return
@@ -3869,12 +3779,11 @@ func countChatImages(msgs []api.Message) int {
 func handleScheduleError(c *gin.Context, name string, err error) {
 	var statusErr api.StatusError
 	switch {
-	case errors.Is(err, cmfrunner.ErrRuntimeUnavailable):
-		// The configured runtime path can contain private host details. Return a
-		// stable actionable error instead of leaking the wrapped lookup failure.
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": cmfrunner.ErrRuntimeUnavailable.Error()})
-	case errors.Is(err, cmfrunner.ErrRuntimeConfiguration):
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": cmfrunner.ErrRuntimeConfiguration.Error()})
+	case errors.Is(err, cmfrunner.ErrRuntimeUnavailable),
+		errors.Is(err, cmfrunner.ErrRuntimeUnsupportedPlatform),
+		errors.Is(err, cmfrunner.ErrRuntimeAutoInstallDisabled),
+		errors.Is(err, cmfrunner.ErrRuntimeConfiguration):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 	case errors.Is(err, errCapabilities), errors.Is(err, errRequired):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, manifest.ErrNoCompatibleManifest):

@@ -43,7 +43,7 @@
     ],
     "primary": {
       "type": "button",
-      "label": "CMF quick start",
+      "label": "Get started",
       "href": "/cmf"
     }
   },
@@ -74,6 +74,7 @@
             "pages": [
               "index",
               "/cmf",
+              "/cmf-models",
               "/cmf-engine",
               "/cmf-release-automation",
               "/development"

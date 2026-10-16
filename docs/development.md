@@ -1,10 +1,10 @@
 # Development
 
 > [!NOTE]
-> This inherited base-Ollama development guide is retained for work on native
-> Ollama engines. It does **not** download, verify, package, or configure the
-> CMF/Cortiq runtime. Use the [CMF/Cortiq guide](cmf.md) for the CMF source
-> smoke flow and this page only for the native build prerequisites it describes.
+> This is the inherited Ollama development guide for the native GGUF and
+> safetensors runners. CMF support needs none of it: `go build -o ollamacmf .`
+> is enough, and the Cortiq runtime installs itself. See the
+> [maintainer notes](cmf-engine.md) for the CMF-specific layout.
 
 Install prerequisites:
 

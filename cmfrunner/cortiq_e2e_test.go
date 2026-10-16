@@ -22,13 +22,13 @@ func TestCortiqDownloadedRuntimeE2E(t *testing.T) {
 	if os.Getenv("CMF_E2E") != "1" {
 		t.Skip("set CMF_E2E=1 with verified runtime inputs to run Cortiq E2E")
 	}
-	binary := os.Getenv(cortiqPathEnv)
+	binary := os.Getenv(EnvCortiqPath)
 	modelPath := os.Getenv("CMF_E2E_MODEL")
 	if !filepath.IsAbs(binary) || !filepath.IsAbs(modelPath) {
 		t.Fatal("CMF E2E requires absolute OLLAMA_CORTIQ_PATH and CMF_E2E_MODEL")
 	}
 
-	client, err := NewClient(modelPath, 1)
+	client, err := NewClient(t.Context(), modelPath, 1)
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}

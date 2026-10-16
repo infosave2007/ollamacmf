@@ -3,20 +3,36 @@ name: test-install
 on:
   pull_request:
     paths:
-      - 'scripts/install.sh'
+      - 'install.sh'
+      - 'install.ps1'
       - '.github/workflows/test-install.yaml'
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  shell:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Run install script
-        run: sh ./scripts/install.sh
-        env:
-          OLLAMA_NO_START: 1 # do not start app
-      - name: Verify ollama is available
-        run: ollama --version
+      - name: Syntax-check the installer
+        run: sh -n install.sh
+      - name: Install the latest published release
+        # Fails until the first release exists; that is expected on a fresh fork.
+        continue-on-error: true
+        run: |
+          OLLAMACMF_INSTALL_DIR="$RUNNER_TEMP/bin" sh ./install.sh
+          "$RUNNER_TEMP/bin/ollamacmf" --version
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax-check the installer
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }

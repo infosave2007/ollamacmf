@@ -873,6 +873,31 @@ type ProgressResponse struct {
 	Completed int64  `json:"completed,omitempty"`
 }
 
+// CMFRuntimeStatus describes the Cortiq runtime that serves CMF models.
+type CMFRuntimeStatus struct {
+	Installed         bool   `json:"installed"`
+	Path              string `json:"path,omitempty"`
+	Source            string `json:"source,omitempty"`
+	Version           string `json:"version,omitempty"`
+	PinnedVersion     string `json:"pinned_version"`
+	Platform          string `json:"platform"`
+	PlatformSupported bool   `json:"platform_supported"`
+	InstallDir        string `json:"install_dir"`
+	AutoInstall       bool   `json:"auto_install"`
+	Error             string `json:"error,omitempty"`
+}
+
+// CMFStatusResponse is the response from [Client.CMFStatus].
+type CMFStatusResponse struct {
+	Version string           `json:"version"`
+	Runtime CMFRuntimeStatus `json:"runtime"`
+}
+
+// CMFRuntimeInstallRequest is the request passed to [Client.CMFInstallRuntime].
+type CMFRuntimeInstallRequest struct {
+	Stream *bool `json:"stream,omitempty"`
+}
+
 // PushRequest is the request passed to [Client.Push].
 type PushRequest struct {
 	Model    string `json:"model"`

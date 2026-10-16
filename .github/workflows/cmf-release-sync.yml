@@ -22,7 +22,7 @@ concurrency:
 
 env:
   CMF_REPOSITORY: infosave2007/cmf
-  CMF_LOCK_FILE: cmf.lock.json
+  CMF_LOCK_FILE: cmfrunner/cmf.lock.json
   CMF_CANDIDATE_BRANCH_PREFIX: automation/cmf-runtime
   CMF_MAX_ARCHIVE_BYTES: "536870912"
   CMF_MAX_CHECKSUM_BYTES: "4096"
@@ -523,7 +523,7 @@ jobs:
 
           # The reviewed fixture is explicitly out of scope for automatic
           # intake. A write-capable job must prove the artifact preserved it.
-          base_fixture="$(jq -cS '.e2eFixture' cmf.lock.json)" || fail 'base lock has no readable E2E fixture'
+          base_fixture="$(jq -cS '.e2eFixture' cmfrunner/cmf.lock.json)" || fail 'base lock has no readable E2E fixture'
           candidate_fixture="$(jq -cS '.e2eFixture' .cmf-candidate/cmf.lock.json)" || fail 'candidate lock has no readable E2E fixture'
           [[ "$candidate_fixture" == "$base_fixture" ]] || fail 'candidate artifact changed the separately reviewed E2E fixture'
 
@@ -618,10 +618,10 @@ jobs:
             exit 1
           }
 
-          install -m 0644 .cmf-candidate/cmf.lock.json cmf.lock.json
+          install -m 0644 .cmf-candidate/cmf.lock.json cmfrunner/cmf.lock.json
           git switch --create "$CMF_CANDIDATE_BRANCH"
-          git add -- cmf.lock.json
-          git diff --cached --quiet && fail 'verified candidate did not change cmf.lock.json'
+          git add -- cmfrunner/cmf.lock.json
+          git diff --cached --quiet && fail 'verified candidate did not change cmfrunner/cmf.lock.json'
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
             commit -m "build: intake CMF runtime ${CMF_CANDIDATE_TAG}"
 

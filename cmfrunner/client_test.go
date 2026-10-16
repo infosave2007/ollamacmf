@@ -308,86 +308,6 @@ func TestClientLoadStopsSidecarWhenCancelledAfterStart(t *testing.T) {
 	}
 }
 
-func TestClientContextLengthIsUnknown(t *testing.T) {
-	if got := (&Client{}).ContextLength(); got != 0 {
-		t.Fatalf("ContextLength() = %d, want 0 for an unknown Cortiq limit", got)
-	}
-}
-
-func TestCMFDefaultNumPredictIsExplicitlyBounded(t *testing.T) {
-	opts := api.DefaultOptions()
-	if opts.NumPredict >= 0 {
-		t.Fatalf("test assumes Ollama default num_predict is unbounded, got %d", opts.NumPredict)
-	}
-
-	var completion completionSamplingOptions
-	completion.applyOptions(&opts)
-	if completion.MaxTokens == nil || *completion.MaxTokens != cmfDefaultMaxTokens {
-		t.Fatalf("completion max_tokens = %#v, want %d", completion.MaxTokens, cmfDefaultMaxTokens)
-	}
-
-	var chat chatSamplingOptions
-	chat.applyOptions(&opts)
-	if chat.MaxTokens == nil || *chat.MaxTokens != cmfDefaultMaxTokens {
-		t.Fatalf("chat max_tokens = %#v, want %d", chat.MaxTokens, cmfDefaultMaxTokens)
-	}
-
-	// LlamaServer callers outside the public HTTP routes can omit Options.
-	// The sidecar contract must remain explicit rather than falling back to a
-	// mutable Cortiq default in that case too.
-	completion = completionSamplingOptions{}
-	completion.applyOptions(nil)
-	if completion.MaxTokens == nil || *completion.MaxTokens != cmfDefaultMaxTokens {
-		t.Fatalf("nil-options completion max_tokens = %#v, want %d", completion.MaxTokens, cmfDefaultMaxTokens)
-	}
-	chat = chatSamplingOptions{}
-	chat.applyOptions(nil)
-	if chat.MaxTokens == nil || *chat.MaxTokens != cmfDefaultMaxTokens {
-		t.Fatalf("nil-options chat max_tokens = %#v, want %d", chat.MaxTokens, cmfDefaultMaxTokens)
-	}
-}
-
-func TestCMFSamplingRejectsInvalidNegativeValues(t *testing.T) {
-	tests := []struct {
-		name   string
-		chat   bool
-		mutate func(*api.Options)
-	}{
-		{
-			name: "chat seed below default sentinel",
-			chat: true,
-			mutate: func(options *api.Options) {
-				options.Seed = -2
-			},
-		},
-		{
-			name: "chat num predict below default sentinel",
-			chat: true,
-			mutate: func(options *api.Options) {
-				options.NumPredict = -2
-			},
-		},
-		{
-			name: "completion num predict below default sentinel",
-			chat: false,
-			mutate: func(options *api.Options) {
-				options.NumPredict = -2
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			options := api.DefaultOptions()
-			tt.mutate(&options)
-			err := validateSamplingOptions(&options, tt.chat)
-			if !errors.Is(err, ErrUnsupported) {
-				t.Fatalf("validateSamplingOptions() error = %v, want ErrUnsupported", err)
-			}
-		})
-	}
-}
-
 func TestCMFRunnerEnvBoundsSlotsAndDropsUnrelatedSecrets(t *testing.T) {
 	t.Run("default slot", func(t *testing.T) {
 		env, err := cmfRunnerEnv([]string{"HOME=/tmp/home", "OLLAMA_API_KEY=secret", "CUDA_VISIBLE_DEVICES=0"}, 1)
@@ -424,46 +344,6 @@ func TestCMFRunnerEnvBoundsSlotsAndDropsUnrelatedSecrets(t *testing.T) {
 				t.Fatal("cmfRunnerEnv() error = nil, want invalid slot error")
 			}
 		})
-	}
-}
-
-func TestFindCortiqUsesOnlyExplicitOrPackagedPathsByDefault(t *testing.T) {
-	temp := t.TempDir()
-	packagedDir := filepath.Join(temp, "packaged")
-	pathDir := filepath.Join(temp, "path")
-	name := cortiqBinaryName(runtime.GOOS)
-	explicit := writeExecutable(t, filepath.Join(temp, "explicit-"+name))
-	packaged := writeExecutable(t, filepath.Join(packagedDir, name))
-	pathBinary := writeExecutable(t, filepath.Join(pathDir, name))
-	search := cortiqBinarySearch{
-		libOllamaPath: packagedDir,
-		path:          pathDir,
-		goos:          runtime.GOOS,
-		goarch:        runtime.GOARCH,
-	}
-
-	got, err := findCortiq(search, explicit, true, false)
-	if err != nil || got != explicit {
-		t.Fatalf("explicit FindCortiq = %q, %v; want %q, nil", got, err, explicit)
-	}
-
-	got, err = findCortiq(search, "", false, false)
-	if err != nil || got != packaged {
-		t.Fatalf("packaged FindCortiq = %q, %v; want %q, nil", got, err, packaged)
-	}
-
-	if err := os.Remove(packaged); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = findCortiq(search, "", false, false); !errors.Is(err, ErrRuntimeUnavailable) {
-		t.Fatalf("default FindCortiq error = %v, want ErrRuntimeUnavailable without PATH fallback", err)
-	}
-	got, err = findCortiq(search, "", false, true)
-	if err != nil || got != pathBinary {
-		t.Fatalf("development PATH FindCortiq = %q, %v; want %q, nil", got, err, pathBinary)
-	}
-	if _, err = findCortiq(search, "cortiq", true, false); !errors.Is(err, ErrRuntimeUnavailable) {
-		t.Fatalf("relative configured FindCortiq error = %v, want ErrRuntimeUnavailable", err)
 	}
 }
 
@@ -512,33 +392,6 @@ func TestCMFMessagesRejectsImages(t *testing.T) {
 	_, err := cmfMessages([]api.Message{{Role: "user", Images: []api.ImageData{{1}}}})
 	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("cmfMessages() error = %v, want ErrUnsupported", err)
-	}
-}
-
-func TestCortiqBinaryCandidatesIncludePackagedAndDevelopmentPaths(t *testing.T) {
-	candidates := cortiqBinaryCandidates(cortiqBinarySearch{
-		libOllamaPath: "/lib/ollama",
-		executable:    "/app/bin/ollama",
-		workingDir:    "/work",
-		goos:          "linux",
-		goarch:        "amd64",
-	})
-	want := map[string]bool{
-		"/lib/ollama/cortiq":                          false,
-		"/app/lib/ollama/cortiq":                      false,
-		"/app/bin/build/lib/ollama/cortiq":            false,
-		"/app/bin/dist/linux-amd64/lib/ollama/cortiq": false,
-		"/work/build/lib/ollama/cortiq":               false,
-	}
-	for _, candidate := range candidates {
-		if _, ok := want[candidate]; ok {
-			want[candidate] = true
-		}
-	}
-	for candidate, found := range want {
-		if !found {
-			t.Errorf("candidate %q missing from %v", candidate, candidates)
-		}
 	}
 }
 
