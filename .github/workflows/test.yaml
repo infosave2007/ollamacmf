@@ -473,7 +473,7 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ninja-build
-          cmake -S . -B build/native-cpu-smoke -G Ninja
+          cmake -S . -B build/native-cpu-smoke -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build/native-cpu-smoke --target ollama-local --parallel 2
           test -x build/native-cpu-smoke/lib/ollama/llama-server
           test -x build/native-cpu-smoke/lib/ollama/llama-quantize
@@ -505,8 +505,13 @@ jobs:
           Write-Host "Using Visual Studio at $vsInstallPath"
           Import-Module $devShell
           Enter-VsDevShell -VsInstallPath $vsInstallPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
+          # ExternalProject configures the nested llama-server build with a
+          # fresh cmake invocation. Keep the generator in the environment so
+          # that invocation is Ninja too, rather than CMake's Visual Studio
+          # default (which would use a Debug configuration by default).
+          $env:CMAKE_GENERATOR = 'Ninja'
           $buildDir = 'build/native-cpu-smoke'
-          cmake -S . -B $buildDir -G Ninja
+          cmake -S . -B $buildDir -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build $buildDir --target ollama-local --parallel 2
           if (!(Test-Path "$buildDir\lib\ollama\llama-server.exe")) {
             throw 'missing llama-server.exe'
