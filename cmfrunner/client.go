@@ -48,8 +48,8 @@ var (
 	// ErrRuntimeConfiguration is returned when an explicit CMF runtime control
 	// is invalid before the sidecar starts.
 	ErrRuntimeConfiguration = errors.New("CMF runtime configuration is invalid")
-	// ErrUnsupported marks parts of the LlamaServer interface that Cortiq's
-	// current public HTTP contract does not expose yet.
+	// ErrUnsupported marks parts of the LlamaServer interface that this CMF
+	// adapter does not currently expose.
 	ErrUnsupported = errors.New("operation is not supported by the CMF runner")
 	// errUnexpectedRedirect prevents a local process that races the sidecar's
 	// port from redirecting prompt-bearing requests to another origin.
@@ -82,10 +82,9 @@ type Client struct {
 
 // NewClient prepares a Cortiq subprocess. The process is only started by Load.
 //
-// Cortiq owns the context limit embedded in the CMF file; its current public
-// server protocol has no configuration or metadata operation for Ollama to
-// enforce or report that limit, so this adapter intentionally does not accept
-// an Ollama num_ctx value.
+// Cortiq owns the context limit embedded in the CMF file. This adapter has no
+// supported configuration or metadata path to enforce or report that limit, so
+// it intentionally does not accept an Ollama num_ctx value.
 func NewClient(modelPath string, parallel int) (*Client, error) {
 	binary, err := FindCortiq()
 	if err != nil {
@@ -854,9 +853,9 @@ func (c *Client) HasExited() bool {
 	}
 }
 
-// ContextLength is unknown: Cortiq does not expose its effective CMF context
-// window through the public runner protocol. Returning zero avoids advertising
-// an unapplied Ollama num_ctx setting as an enforced limit.
+// ContextLength is unknown: this adapter does not derive the effective CMF
+// context window. Returning zero avoids advertising an unapplied Ollama num_ctx
+// setting as an enforced limit.
 func (c *Client) ContextLength() int { return 0 }
 
 func (c *Client) GetDeviceInfos(context.Context) []ml.DeviceInfo { return nil }
@@ -971,8 +970,8 @@ func nonEmpty(value, fallback string) string {
 	return fallback
 }
 
-// completionSamplingOptions is deliberately restricted to the current
-// /v1/completions contract offered by Cortiq.
+// completionSamplingOptions is the deliberately small subset this bootstrap
+// forwards to Cortiq's /v1/completions endpoint.
 type completionSamplingOptions struct {
 	Temperature *float32 `json:"temperature,omitempty"`
 	MaxTokens   *int     `json:"max_tokens,omitempty"`
@@ -987,8 +986,8 @@ func (s *completionSamplingOptions) applyOptions(options *api.Options) {
 	s.MaxTokens = &count
 }
 
-// chatSamplingOptions is deliberately restricted to the current
-// /v1/chat/completions contract offered by Cortiq.
+// chatSamplingOptions is the deliberately small subset this bootstrap forwards
+// to Cortiq's /v1/chat/completions endpoint.
 type chatSamplingOptions struct {
 	Temperature *float32 `json:"temperature,omitempty"`
 	TopP        *float32 `json:"top_p,omitempty"`
@@ -1010,23 +1009,31 @@ func (s *chatSamplingOptions) applyOptions(options *api.Options) {
 	s.MaxTokens = &count
 }
 
-// Cortiq's public OpenAI-compatible contract has no unbounded max_tokens
-// representation. Map Ollama's default num_predict=-1 explicitly to the
-// documented Cortiq-safe default rather than silently omitting the field and
-// relying on server defaults that could change in a later runtime.
+// This adapter has no unbounded max_tokens mapping. Map Ollama's default
+// num_predict=-1 explicitly to the adapter's documented 256-token fallback
+// rather than silently omitting the field and relying on server defaults that
+// could change in a later runtime.
 func cmfMaxTokens(numPredict int) int {
-	if numPredict < 0 {
+	if numPredict == -1 {
 		return cmfDefaultMaxTokens
 	}
 	return numPredict
 }
 
-// validateSamplingOptions rejects non-default controls that Cortiq v0.8.19
-// does not expose. Default Ollama values remain accepted so ordinary requests
-// work without silently pretending that an unsupported override took effect.
+// validateSamplingOptions is the defense-in-depth check for normalized options
+// delivered to the LlamaServer. The public server separately validates raw CMF
+// option maps before scheduling, so it can reject unsupported explicit keys
+// even when their value equals an Ollama default. Cortiq itself may expose a
+// broader OpenAI-compatible sampling surface.
 func validateSamplingOptions(options *api.Options, chat bool) error {
 	if options == nil {
 		return nil
+	}
+	if options.NumPredict < -1 {
+		return fmt.Errorf("%w: CMF num_predict must be -1 or non-negative", ErrUnsupported)
+	}
+	if chat && options.Seed < -1 {
+		return fmt.Errorf("%w: CMF seed must be -1 or non-negative", ErrUnsupported)
 	}
 	defaults := api.DefaultOptions()
 	var unsupported []string

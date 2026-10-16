@@ -347,6 +347,47 @@ func TestCMFDefaultNumPredictIsExplicitlyBounded(t *testing.T) {
 	}
 }
 
+func TestCMFSamplingRejectsInvalidNegativeValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		chat   bool
+		mutate func(*api.Options)
+	}{
+		{
+			name: "chat seed below default sentinel",
+			chat: true,
+			mutate: func(options *api.Options) {
+				options.Seed = -2
+			},
+		},
+		{
+			name: "chat num predict below default sentinel",
+			chat: true,
+			mutate: func(options *api.Options) {
+				options.NumPredict = -2
+			},
+		},
+		{
+			name: "completion num predict below default sentinel",
+			chat: false,
+			mutate: func(options *api.Options) {
+				options.NumPredict = -2
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			options := api.DefaultOptions()
+			tt.mutate(&options)
+			err := validateSamplingOptions(&options, tt.chat)
+			if !errors.Is(err, ErrUnsupported) {
+				t.Fatalf("validateSamplingOptions() error = %v, want ErrUnsupported", err)
+			}
+		})
+	}
+}
+
 func TestCMFRunnerEnvBoundsSlotsAndDropsUnrelatedSecrets(t *testing.T) {
 	t.Run("default slot", func(t *testing.T) {
 		env, err := cmfRunnerEnv([]string{"HOME=/tmp/home", "OLLAMA_API_KEY=secret", "CUDA_VISIBLE_DEVICES=0"}, 1)

@@ -1,5 +1,11 @@
 # Development
 
+> [!NOTE]
+> This inherited base-Ollama development guide is retained for work on native
+> Ollama engines. It does **not** download, verify, package, or configure the
+> CMF/Cortiq runtime. Use the [CMF/Cortiq guide](cmf.md) for the CMF source
+> smoke flow and this page only for the native build prerequisites it describes.
+
 Install prerequisites:
 
 - [Go](https://go.dev/doc/install)

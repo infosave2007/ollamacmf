@@ -1,11 +1,18 @@
-# CMF engine: experimental bootstrap and packaging contract
+---
+title: CMF engine contract
+sidebarTitle: Engine contract
+---
 
-This independent fork of Ollama contains an **experimental** adapter for
-[CMF](https://github.com/infosave2007/cmf) / Cortiq. It imports one opaque
-`.cmf` model blob, starts Cortiq as a sidecar, and keeps Ollama responsible for
-its model store and public API. [`../cmf.lock.json`](../cmf.lock.json) is the
-**sole canonical lock** for the reviewed Cortiq desktop runtime inputs and the
-matching, reviewed runnable E2E fixture.
+This is the maintainer-facing contract for the experimental CMF/Cortiq adapter
+in this independent Ollama fork. For a source-build, runtime verification,
+local import, API, compatibility, and troubleshooting guide, start with
+[CMF/Cortiq guide](cmf.md). For the candidate-only upstream runtime workflow,
+see [CMF runtime intake automation](cmf-release-automation.md).
+
+The adapter imports one opaque `.cmf` model blob, starts Cortiq as a sidecar,
+and keeps Ollama responsible for its model store and public API.
+[`cmf.lock.json`](https://github.com/infosave2007/ollamacmf/blob/main/cmf.lock.json) is the **sole canonical lock** for the
+reviewed Cortiq desktop runtime inputs and matching runnable E2E fixture.
 
 This is not a public product release, installer, Docker image, or replacement
 for an official Ollama distribution. No Cortiq binary is bundled yet. Treat the
@@ -35,7 +42,7 @@ native chat endpoint; only a raw `POST /api/generate` request is carried to
 Cortiq's completion endpoint. Neither public Ollama endpoint exposes the
 sidecar port.
 
-## Experimental local use
+## Local source use: implementation contract
 
 Use a build of **this fork**; there is no packaged CMF-enabled release yet.
 Do not use an official Ollama installer for these commands. From the checkout
@@ -51,13 +58,13 @@ export OLLAMA_BIN="$HOME/.local/bin/ollamacmf"
 
 Export `OLLAMA_BIN` in every terminal that follows. On Windows, build the same
 checkout into an explicitly named `.exe` and use its absolute path. The server
-process must be able to execute a Cortiq binary matching the host and the CMF
-model must be a real CMF v2 file: the adapter checks its fixed 128-byte
+process must be able to execute a Cortiq binary matching its build target, and
+the CMF model must be a real CMF v2 file: the adapter checks its fixed 128-byte
 envelope, version, required features, runnable model kind, and section bounds
 before it writes a manifest. Cortiq remains the authority for validating the
 opaque model header, tensor directory, and weights.
 
-1. Obtain the host's Cortiq archive named in [`../cmf.lock.json`](../cmf.lock.json),
+1. Obtain the execution-target Cortiq archive named in [`cmf.lock.json`](https://github.com/infosave2007/ollamacmf/blob/main/cmf.lock.json),
    verify it as described in [Verification procedure](#verification-procedure),
    and extract it without running it. Put the executable in a user-controlled
    location; on Unix, preserve its executable bit. For example, after verified
@@ -130,51 +137,52 @@ opaque model header, tensor directory, and weights.
 
 ### Current feature and resource limits
 
-The adapter deliberately rejects controls that Cortiq v0.8.19 does not expose
-through its public HTTP protocol rather than silently ignoring them:
+The bootstrap deliberately maps only a limited subset of Ollama controls. The
+limits below describe this fork's adapter surface, **not** a claim that Cortiq
+v0.8.19 lacks every corresponding HTTP field. Unsupported controls are
+rejected rather than silently ignored:
 
 - embeddings; tokenization, detokenization, and rendered chat templates;
 - images and other completion media;
 - constrained/structured output (`format`) and log probabilities;
-- tool use and positive thinking requests. Cortiq reports optional model/template
-  capabilities only after the sidecar starts, but Ollama must validate
-  capabilities before scheduling it. The bootstrap therefore advertises
-  completion only rather than accepting controls that could be ignored;
+- tool use and positive thinking requests. The bootstrap advertises completion
+  only before scheduling, rather than accepting controls it cannot promise to
+  support;
 - CMF model `PARAMETER` values other than `temperature` and `num_predict`.
-  For request options, only `temperature`, `num_predict`, `top_p`, and `seed`
-  are accepted; every other option key (including `top_k`, `min_p`,
-  repetition/presence/frequency penalties, `stop`, and `num_keep`) is rejected
-  before scheduling, even if its value matches an Ollama default (for example,
-  an explicit `top_k: 40`). Native chat forwards `top_p` and a non-negative
-  `seed`; raw `/api/generate` rejects either when it is explicitly supplied,
-  including an Ollama-default value, because Cortiq's completion endpoint
-  exposes neither control;
-- explicit `truncate` or `shift`. Cortiq owns context policy and does not
-  expose Ollama-compatible token accounting, truncation, or context shifting,
-  so the adapter rejects an explicit request rather than silently ignoring it.
+  The adapter accepts `temperature`, `num_predict` (`-1` default or
+  non-negative), `top_p`, and `seed` (`-1` default or non-negative) for native
+  chat. Its raw `/api/generate` path accepts only
+  `temperature` and `num_predict`, and rejects explicitly supplied `top_p` or
+  `seed`, including Ollama-default values. Every other option key (including
+  `top_k`, `min_p`, repetition/presence/frequency penalties, `stop`, and
+  `num_keep`) is rejected before scheduling, even if its value matches an
+  Ollama default (for example, an explicit `top_k: 40`). These restrictions are
+  deliberate current adapter choices; extending the mapping requires tests;
+- explicit `truncate` or `shift`. The adapter has no Ollama-compatible CMF
+  token accounting, truncation, or context-shifting implementation, so it
+  rejects an explicit request rather than silently ignoring it.
 
 `num_predict` maps to Cortiq `max_tokens`. Ollama's usual unbounded default
-(`num_predict=-1`) has no equivalent in Cortiq's public protocol, so this
-adapter sends an explicit, stable limit of **256** tokens rather than relying on
-a mutable sidecar default. Set a finite `num_predict` when a different output
-budget is required.
+(`num_predict=-1`) has no shared unbounded representation in this adapter, so
+it sends an explicit, stable limit of **256** tokens rather than relying on a
+Cortiq model/server default. Values below `-1` are rejected. Set a finite
+`num_predict` when a different output budget is required.
 
-CMF owns its context window and chat formatting. The current Cortiq protocol
-has no metadata/configuration operation through which this adapter can enforce
-or report Ollama's `num_ctx`, so the effective context limit is unknown to
-Ollama. It does not perform token-accurate truncation; oversized requests are
-owned by Cortiq and may fail or be handled differently from a GGUF runner.
+CMF owns its context window and chat formatting. This adapter has no supported
+metadata/configuration path through which it can enforce or report Ollama's
+`num_ctx`, so the effective context limit is unknown to Ollama. It does not
+perform token-accurate truncation; oversized requests are owned by Cortiq and
+may fail or be handled differently from a GGUF runner.
 
-Cortiq also independently selects CPU/GPU execution. The bootstrap cannot
-reliably report per-GPU VRAM or device placement to Ollama's scheduler, so do
-not treat Ollama's normal resource accounting as an enforced CMF limit. Keep
-concurrency conservative on a trusted host. Until that accounting exists, CMF
-runner residency is exclusive: loading a CMF model unloads every other Ollama
-runner, and loading another model unloads the CMF runner.
-`CMF_SERVE_SLOTS`, if explicitly set for the Cortiq process, must be a positive
-integer and remains
-authoritative; otherwise the adapter sets it to one so Cortiq does not apply
-its multi-slot default. The sidecar receives a restricted runtime environment
+The bootstrap cannot reliably report per-GPU VRAM or device placement to
+Ollama's scheduler, so do not treat Ollama's normal resource accounting as an
+enforced CMF limit. Keep concurrency conservative on a trusted host. Until that
+accounting exists, CMF runner residency is exclusive: loading a CMF model
+unloads every other Ollama runner, and loading another model unloads the CMF
+runner. `CMF_SERVE_SLOTS`, if explicitly set for the Cortiq process, must be a
+positive integer and remains authoritative. In normal server flow the scheduler
+supplies one CMF slot, so the adapter sets it to one for conservative
+concurrency. The sidecar receives a restricted runtime environment
 (CMF/GPU/loader/locale controls, not arbitrary Ollama API credentials), so put
 only intentional Cortiq tuning values under the `CMF_` namespace.
 
@@ -254,18 +262,19 @@ unpinned `latest` release, branch, tag, or source checkout as a fallback.
 
 ## Runnable E2E fixture
 
-[`../testdata/cmf/tiny-v0.8.19.cmf`](../testdata/cmf/tiny-v0.8.19.cmf) is a
+[`testdata/cmf/tiny-v0.8.19.cmf`](https://github.com/infosave2007/ollamacmf/blob/main/testdata/cmf/tiny-v0.8.19.cmf) is a
 small, complete CPU-runnable generative CMF v2 model. It is deliberately not
 the synthetic envelope used by Go unit tests. Its checked-in provenance records
 the exact `infosave2007/cmf` source commit, generator-script hashes, generation
 commands, toolchain record, artifact SHA-256, license, and validation contract:
-[`../testdata/cmf/tiny-v0.8.19.provenance.json`](../testdata/cmf/tiny-v0.8.19.provenance.json).
+[`testdata/cmf/tiny-v0.8.19.provenance.json`](https://github.com/infosave2007/ollamacmf/blob/main/testdata/cmf/tiny-v0.8.19.provenance.json).
 
-This fixture was manually exercised on the pinned macOS arm64 runtime through
-`serve`, `/healthz`, completion, and streamed chat. CI repeats the stronger
-adapter-level E2E with the exact Linux amd64 archive. It does not assert model
-text, only protocol completion and cleanup; the fixture's tiny random weights
-are for contract testing, not model quality.
+This fixture was manually exercised through `serve`, normal `/api/chat`, and
+raw `/api/generate` using the pinned macOS amd64 runtime under Rosetta on the
+audit host. That is a local adapter smoke test, not native-Intel or macOS arm64
+coverage. CI repeats the stronger adapter-level E2E with the exact Linux amd64
+archive. It does not assert model text, only protocol completion and cleanup;
+the fixture's tiny random weights are for contract testing, not model quality.
 
 The intake workflow never regenerates this artifact. A future CMF runtime tag
 will initially retain a mismatched fixture record, causing candidate CI to fail
@@ -299,7 +308,7 @@ target or an unreviewed source build.
 The exact final distribution layout is owned by a future packaging integration,
 but a package built from this lock must preserve these invariants:
 
-1. Install exactly the lock-listed executable for the matching host target:
+1. Install exactly the lock-listed executable for the matching binary target:
    `cortiq` on Unix and `cortiq.exe` on Windows.
 2. Keep the executable in a CMF-specific runner payload location, separate from
    llama.cpp, MLX, and other engine payloads. Do not overwrite or replace an
@@ -319,22 +328,36 @@ revision so a shipped runner can be traced back to its inputs.
 
 ## Verification procedure
 
-Before an artifact enters a candidate build, download the archive and its
-adjacent `.sha256` file from the *same pinned release*. Verify the checksum
-before extraction. For a Unix target, from a disposable directory:
+Before an artifact enters a candidate build, use the root
+[locked-runtime procedure](https://github.com/infosave2007/ollamacmf/blob/main/README.md#2-download-the-locked-runtime-verify-it-then-extract-it)
+or an equivalent implementation. The release-provided `.sha256` sidecar alone
+is insufficient: this lock currently records an unsigned tag and a mutable
+release. A conforming procedure must, before extraction:
 
-```sh
-curl --fail --location --retry 3 --retry-all-errors \
-  -O https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-x86_64-unknown-linux-gnu.tar.gz
-curl --fail --location --retry 3 --retry-all-errors \
-  -O https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-x86_64-unknown-linux-gnu.tar.gz.sha256
-shasum -a 256 -c cortiq-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -tzf cortiq-x86_64-unknown-linux-gnu.tar.gz
-```
+1. Select exactly one platform record from `cmf.lock.json`; never infer or
+   substitute a target.
+2. Download only the HTTPS archive and checksum URLs from that record, then
+   compare **both** files' byte counts and SHA-256 values directly with the
+   lock.
+3. Check that the now-locked checksum sidecar names the same archive name and
+   archive SHA-256.
+4. Run the tracked verifier rather than `tar -xzf` or `Expand-Archive` alone:
 
-For Windows, compare the expected hexadecimal value from the `.sha256` file
-with `Get-FileHash -Algorithm SHA256` before expanding the ZIP. Do not use
-`curl | tar`, `Invoke-Expression`, or a mutable redirect such as `latest`.
+   ```sh
+   python3 .github/scripts/verify_cmf_runtime_archive.py \
+     --archive /absolute/path/to/archive --format tar.gz --entry cortiq
+   ```
+
+   Add `--extract-to /an/existing/non-symlink/directory` only after the
+   metadata checks succeed; that directory must not already contain the
+   expected executable. The verifier rejects unexpected entries, links,
+   special files, non-executable payloads, and oversized archives; it never
+   executes the payload.
+
+For Windows, use the [PowerShell procedure in the CMF/Cortiq guide](cmf.md#windows-powershell-runtime-setup),
+including the tracked verifier. Do not use `curl | tar`, `Invoke-Expression`, a
+mutable redirect such as `latest`, `Expand-Archive` alone, or an extractor that
+trusts arbitrary archive paths.
 
 The v0.8.19 lock was independently checked by downloading all five listed
 desktop archives, validating each against its release-provided SHA-256 file,
