@@ -2317,20 +2317,21 @@ func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 }
 
 func versionHandler(cmd *cobra.Command, _ []string) {
+	name := cliName()
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
+		fmt.Printf("%s version is %s\n", name, version.Version)
 		return
 	}
 
 	serverVersion, err := client.Version(cmd.Context())
-	if err != nil {
-		fmt.Println("Warning: could not connect to a running Ollama instance")
+	if err != nil || serverVersion == "" {
+		// No running server: the client version is the only one there is.
+		fmt.Printf("%s version is %s\n", name, version.Version)
+		return
 	}
 
-	if serverVersion != "" {
-		fmt.Printf("ollama version is %s\n", serverVersion)
-	}
-
+	fmt.Printf("%s version is %s\n", name, serverVersion)
 	if serverVersion != version.Version {
 		fmt.Printf("Warning: client version is %s\n", version.Version)
 	}

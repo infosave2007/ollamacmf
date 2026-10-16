@@ -90,7 +90,7 @@ case ":$PATH:" in
 esac
 
 say ""
-say "Installed $("$dest/ollamacmf" --version 2>/dev/null | head -n1 || echo ollamacmf)."
+say "Installed: $("$dest/ollamacmf" --version 2>/dev/null | head -n1 || echo ollamacmf) -> $dest/ollamacmf"
 say ""
 say "Next steps:"
 say "  ollamacmf serve                                              # start the server"
