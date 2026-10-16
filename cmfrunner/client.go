@@ -220,10 +220,6 @@ func packagedCortiqBinaryCandidates(search cortiqBinarySearch) []string {
 	if goos == "" {
 		goos = runtime.GOOS
 	}
-	goarch := search.goarch
-	if goarch == "" {
-		goarch = runtime.GOARCH
-	}
 	name := cortiqBinaryName(goos)
 
 	seen := make(map[string]bool)

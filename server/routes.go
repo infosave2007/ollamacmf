@@ -285,20 +285,6 @@ func normalizeRunner(runner string) (string, error) {
 	}
 }
 
-// scheduleRunner schedules a runner after validating inputs such as capabilities and model options.
-// It returns the allocated runner, model instance, and consolidated options if successful and error otherwise.
-func (s *Server) scheduleRunner(ctx context.Context, name, selectedRunner string, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration, shift *bool) (llm.LlamaServer, *Model, *api.Options, error) {
-	if name == "" {
-		return nil, nil, nil, fmt.Errorf("model %w", errRequired)
-	}
-
-	model, err := s.getExistingModelForRunner(name, selectedRunner)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return s.scheduleRunnerForModel(ctx, model, caps, requestOpts, keepAlive, shift)
-}
-
 // scheduleRunnerForModel retains the request's resolved model, including its selected
 // manifest-list child, without repeating model lookup and metadata loading.
 func (s *Server) scheduleRunnerForModel(ctx context.Context, m *Model, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration, shift *bool) (llm.LlamaServer, *Model, *api.Options, error) {
