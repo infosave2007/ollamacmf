@@ -1,0 +1,22 @@
+# Retained upstream Ollama reference content; never publish it as ollamacmf docs.
+/README.md
+/api.md
+/api/
+/capabilities/
+/cli.mdx
+/cloud.mdx
+/context-length.mdx
+/docker.mdx
+/examples.md
+/faq.mdx
+/gpu.mdx
+/import.mdx
+/integrations/
+/linux.mdx
+/macos.mdx
+/modelfile.mdx
+/quickstart.mdx
+/template.mdx
+/troubleshooting.mdx
+/windows.mdx
+/tools/

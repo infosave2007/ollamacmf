@@ -1,384 +1,344 @@
-<p align="center">
-  <a href="https://ollama.com">
-    <img src="https://github.com/ollama/ollama/assets/3325447/0d0b44e2-8f4a-4e99-9b52-a5c1c741c8f7" alt="ollama" width="200"/>
-  </a>
-</p>
+# ollamacmf
 
-# Ollama
+> **Experimental, source-only Ollama fork that runs locally imported CMF v2 text
+> models through a Cortiq sidecar.**
 
-Start building with open models. Access the latest releases locally or in the cloud with complete privacy.
+[CMF quick start](docs/cmf.md) · [compatibility and safety](docs/cmf.md#compatibility-and-limits) · [runtime intake](docs/cmf-release-automation.md) · [development](docs/development.md) · [upstream Ollama](https://github.com/ollama/ollama)
 
-## Download
+`ollamacmf` is an independent fork of [Ollama](https://github.com/ollama/ollama).
+It is not affiliated with Ollama, Inc.  The fork keeps Ollama's local model
+store and public API, then starts [Cortiq](https://github.com/infosave2007/cmf)
+as a local subprocess for a runnable CMF model.
 
-### macOS
+> [!WARNING]
+> This is a bootstrap integration for a **trusted, single-user host**. Cortiq's
+> sidecar uses unauthenticated loopback HTTP, and the current launch sequence
+> has a local port bind race. Do not expose the sidecar, use it on a multi-user
+> or hostile-workload host, or treat loopback as an authorization boundary.
+> Read the [security boundary](docs/cmf.md#security-boundary) before importing a
+> model.
 
-```shell
-curl -fsSL https://ollama.com/install.sh | sh
+## Status at a glance
+
+| Area | Current status |
+| --- | --- |
+| CMF model path | Local `FROM /absolute/path/model.cmf` import for runnable generative CMF v2 text models |
+| Runtime | An explicitly configured, build-target-matched Cortiq executable; **not** embedded or bundled |
+| Distribution | Source checkout only; no CMF-enabled official binaries, installer, or Docker image |
+| Registry | CMF `ollama pull` and `ollama push` are intentionally rejected |
+| Automation | A scheduled/repository-dispatch workflow proposes a verified **candidate lock PR**; it does not package, sign, or publish a release |
+| Platform evidence | Linux `amd64` adapter E2E runs in CI; other locked desktop artifacts are reviewed inputs, not a production-support promise |
+
+The [canonical lock](cmf.lock.json) records the exact Cortiq release assets
+reviewed by this revision. It is an integrity record, not a cryptographic
+provenance attestation: the currently pinned upstream tag is unsigned and its
+GitHub release was not immutable when checked. Never substitute `latest`, a
+random `PATH` binary, or an artifact for a different OS/architecture.
+
+## What the fork adds
+
+```text
+Ollama CLI / local Ollama API
+             |
+             v
+      ollamacmf server
+  (model store + scheduling)
+             |
+             v
+  cmfrunner -> Cortiq subprocess -> local .cmf model
+      127.0.0.1:<ephemeral port>
 ```
 
-or [download manually](https://ollama.com/download/Ollama.dmg)
+Clients continue to call the normal Ollama endpoint. The ephemeral Cortiq port
+is an implementation detail and must not be used by clients:
 
-### Windows
+- `ollama run`, `POST /api/chat`, and formatted `POST /api/generate` use
+  Cortiq's chat-completions endpoint so Cortiq owns the model tokenizer and
+  chat template.
+- `POST /api/generate` with `"raw": true` uses Cortiq's completion endpoint.
+- Ollama stores the CMF blob as an opaque model layer. It performs inexpensive
+  CMF-envelope checks at import time; Cortiq remains responsible for the full
+  model and weights validation.
 
-```shell
-irm https://ollama.com/install.ps1 | iex
-```
+## Verified local smoke test (macOS/Linux)
 
-or [download manually](https://ollama.com/download/OllamaSetup.exe)
+This is deliberately a source-build flow. **Do not use an official Ollama
+installer or image for these steps**: those distributions do not contain this
+fork's CMF adapter.
 
-### Linux
+### 1. Build this checkout
 
-```shell
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-[Manual install instructions](https://docs.ollama.com/linux#manual-install)
-
-### Docker
-
-The official [Ollama Docker image](https://hub.docker.com/r/ollama/ollama) `ollama/ollama` is available on Docker Hub.
-
-### Libraries
-
-- [ollama-python](https://github.com/ollama/ollama-python)
-- [ollama-js](https://github.com/ollama/ollama-js)
-
-### Community
-
-- [Discord](https://discord.gg/ollama)
-- [𝕏 (Twitter)](https://x.com/ollama)
-- [Reddit](https://reddit.com/r/ollama)
-
-## Get started
-
-```
-ollama
-```
-
-You'll be prompted to run a model or connect Ollama to your existing agents or applications such as `Claude Code`, `OpenClaw`, `OpenCode` , `Codex`, `Copilot`,  and more.
-
-### Coding
-
-To launch a specific integration:
-
-```
-ollama launch claude
-```
-
-Supported integrations include [Claude Code](https://docs.ollama.com/integrations/claude-code), [Codex](https://docs.ollama.com/integrations/codex), [Copilot CLI](https://docs.ollama.com/integrations/copilot-cli), [DeepSeek Harness](https://docs.ollama.com/integrations/deepseek-harness), [Droid](https://docs.ollama.com/integrations/droid), and [OpenCode](https://docs.ollama.com/integrations/opencode).
-
-### AI assistant
-
-Use [OpenClaw](https://docs.ollama.com/integrations/openclaw) to turn Ollama into a personal AI assistant across WhatsApp, Telegram, Slack, Discord, and more:
-
-```
-ollama launch openclaw
-```
-
-### Chat with a model
-
-Run and chat with [Gemma 4](https://ollama.com/library/gemma4):
-
-```
-ollama run gemma4
-```
-
-See [ollama.com/library](https://ollama.com/library) for the full list.
-
-See the [quickstart guide](https://docs.ollama.com/quickstart) for more details.
-
-## REST API
-
-Ollama has a REST API for running and managing models.
-
-```
-curl http://localhost:11434/api/chat -d '{
-  "model": "gemma4",
-  "messages": [{
-    "role": "user",
-    "content": "Why is the sky blue?"
-  }],
-  "stream": false
-}'
-```
-
-See the [API documentation](https://docs.ollama.com/api) for all endpoints.
-
-### Python
-
-```
-pip install ollama
-```
-
-```python
-from ollama import chat
-
-response = chat(model='gemma4', messages=[
-  {
-    'role': 'user',
-    'content': 'Why is the sky blue?',
-  },
-])
-print(response.message.content)
-```
-
-### JavaScript
-
-```
-npm i ollama
-```
-
-```javascript
-import ollama from "ollama";
-
-const response = await ollama.chat({
-  model: "gemma4",
-  messages: [{ role: "user", content: "Why is the sky blue?" }],
-});
-console.log(response.message.content);
-```
-
-## Supported backends
-
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) project founded by Georgi Gerganov.
-
-## Experimental CMF/Cortiq engine
-
-This fork adds an experimental local CMF/Cortiq sidecar adapter: Ollama stores
-and serves the model through its usual API while Cortiq executes the opaque
-`.cmf` blob. It is **not** bundled in an official or public `ollamacmf` release,
-is local-import only (not registry pull/push), and is safe only on a trusted,
-single-user host until the sidecar has an authenticated private protocol.
-
-### Local checkout quick start
-
-Build and run this checkout's binary, not an official `ollama` installer:
+Prerequisites: Git, Go, `curl`, `jq`, Python 3, and either `shasum` or
+`sha256sum`. Build for the same OS/architecture as the Cortiq runtime. The
+selector below uses the Go build target, not `uname`, so it also remains correct
+when Go runs under an emulator.
 
 ```sh
-mkdir -p "$HOME/.local/bin"
-go build -o "$HOME/.local/bin/ollamacmf" .
-export OLLAMA_BIN="$HOME/.local/bin/ollamacmf"
-export OLLAMA_CORTIQ_PATH=/absolute/path/to/verified/cortiq
+git clone https://github.com/infosave2007/ollamacmf.git
+cd ollamacmf
+go build -o ./ollamacmf .
+export OLLAMA_BIN="$(pwd)/ollamacmf"
+"$OLLAMA_BIN" --version
+```
+
+`go build` is sufficient for the CMF smoke flow below. Build the full native
+Ollama payload with the [development guide](docs/development.md) when working
+on the other Ollama engines.
+
+### 2. Download the *locked* runtime, verify it, then extract it
+
+The POSIX-`sh` snippet selects exactly one artifact for the local Go build
+target from this checkout's `cmf.lock.json`; it fails rather than substituting
+a target. Before extraction, it checks each downloaded file's size and SHA-256
+**directly against the lock**, checks that the pinned checksum sidecar names the
+same archive hash, and uses the tracked safe archive verifier. It downloads but
+never executes the runtime during setup.
+
+```sh
+set -eu
+
+fail() {
+  printf '%s\n' "error: $*" >&2
+  exit 1
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk 'NR == 1 { print $1 }'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk 'NR == 1 { print $1 }'
+  else
+    fail 'need shasum or sha256sum'
+  fi
+}
+
+file_size() {
+  wc -c < "$1" | tr -d '[:space:]'
+}
+
+require_sha256() {
+  value=$1
+  label=$2
+  case "$value" in
+    ''|*[!0123456789abcdef]*) fail "$label is not a lowercase SHA-256" ;;
+  esac
+  [ "${#value}" -eq 64 ] || fail "$label is not a 64-character SHA-256"
+}
+
+require_positive_decimal() {
+  value=$1
+  label=$2
+  case "$value" in
+    ''|*[!0123456789]*) fail "$label is not a positive decimal byte count" ;;
+  esac
+  [ "$value" -gt 0 ] 2>/dev/null || fail "$label is not a positive decimal byte count"
+}
+
+require_basename() {
+  value=$1
+  label=$2
+  case "$value" in
+    ''|.|..|*/*|*\\*|*[!A-Za-z0-9._-]*) fail "$label is not a safe file name" ;;
+  esac
+}
+
+repo_root=$(pwd -P)
+[ -f "$repo_root/cmf.lock.json" ] || fail 'run this from the checkout root'
+verifier="$repo_root/.github/scripts/verify_cmf_runtime_archive.py"
+[ -f "$verifier" ] || fail 'CMF archive verifier is missing'
+command -v python3 >/dev/null 2>&1 || fail 'python3 is required for safe archive extraction'
+
+case "$(go env GOOS)" in
+  linux|darwin) cmf_os=$(go env GOOS) ;;
+  *) fail 'use the Windows guide or an explicitly reviewed build target' ;;
+esac
+case "$(go env GOARCH)" in
+  amd64|arm64) cmf_arch=$(go env GOARCH) ;;
+  *) fail "unsupported Go build architecture: $(go env GOARCH)" ;;
+esac
+cmf_platform="$cmf_os/$cmf_arch"
+
+asset=$(jq -ce --arg platform "$cmf_platform" '
+  [.artifacts[] | select(.platform == $platform)] as $matches
+  | if ($matches | length) == 1 then $matches[0]
+    else error("expected exactly one reviewed artifact for \($platform); found \($matches | length)")
+    end
+' "$repo_root/cmf.lock.json") || fail "could not select a unique reviewed runtime for $cmf_platform"
+
+asset_field() {
+  printf '%s\n' "$asset" | jq -er "$1"
+}
+
+archive_url=$(asset_field '.archive.url') || fail 'lock has no archive URL'
+archive_name=$(asset_field '.archive.name') || fail 'lock has no archive name'
+archive_size=$(asset_field '.archive.sizeBytes') || fail 'lock has no archive byte count'
+archive_sha256=$(asset_field '.archive.sha256') || fail 'lock has no archive SHA-256'
+archive_format=$(asset_field '.archive.format') || fail 'lock has no archive format'
+archive_entry=$(asset_field '.archive.entries | if type == "array" and length == 1 then .[0] else error("expected one archive entry") end') || fail 'lock has invalid archive entries'
+checksum_url=$(asset_field '.checksum.url') || fail 'lock has no checksum URL'
+checksum_name=$(asset_field '.checksum.name') || fail 'lock has no checksum name'
+checksum_size=$(asset_field '.checksum.sizeBytes') || fail 'lock has no checksum byte count'
+checksum_sha256=$(asset_field '.checksum.sha256') || fail 'lock has no checksum SHA-256'
+executable=$(asset_field '.installedExecutable') || fail 'lock has no installed executable name'
+
+require_basename "$archive_name" 'archive name'
+require_basename "$checksum_name" 'checksum name'
+require_basename "$archive_entry" 'archive entry'
+require_basename "$executable" 'installed executable'
+require_positive_decimal "$archive_size" 'archive size'
+require_positive_decimal "$checksum_size" 'checksum size'
+require_sha256 "$archive_sha256" 'locked archive SHA-256'
+require_sha256 "$checksum_sha256" 'locked checksum SHA-256'
+[ "$archive_entry" = "$executable" ] || fail 'lock archive entry and installed executable disagree'
+case "$archive_format" in tar.gz) ;; *) fail "unsupported Unix archive format: $archive_format" ;; esac
+case "$archive_url" in https://*) ;; *) fail 'archive URL must use HTTPS' ;; esac
+case "$checksum_url" in https://*) ;; *) fail 'checksum URL must use HTTPS' ;; esac
+
+runtime_dir="$repo_root/.runtime/cortiq"
+mkdir -p "$runtime_dir"
+[ -d "$runtime_dir" ] || fail 'runtime path is not a directory'
+[ ! -e "$runtime_dir/$executable" ] || fail "refusing to overwrite existing $runtime_dir/$executable"
+archive_path="$runtime_dir/$archive_name"
+checksum_path="$runtime_dir/$checksum_name"
+
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  --output "$archive_path" "$archive_url"
+[ "$(file_size "$archive_path")" = "$archive_size" ] || fail 'downloaded archive size differs from lock'
+actual_archive_sha256=$(sha256_file "$archive_path") || fail 'could not hash downloaded archive'
+require_sha256 "$actual_archive_sha256" 'downloaded archive SHA-256'
+[ "$actual_archive_sha256" = "$archive_sha256" ] || fail 'downloaded archive SHA-256 differs from lock'
+
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  --output "$checksum_path" "$checksum_url"
+[ "$(file_size "$checksum_path")" = "$checksum_size" ] || fail 'downloaded checksum size differs from lock'
+actual_checksum_sha256=$(sha256_file "$checksum_path") || fail 'could not hash downloaded checksum asset'
+require_sha256 "$actual_checksum_sha256" 'downloaded checksum asset SHA-256'
+[ "$actual_checksum_sha256" = "$checksum_sha256" ] || fail 'downloaded checksum asset SHA-256 differs from lock'
+
+checksum_fields=$(awk 'NR == 1 { fields = NF } END { if (NR != 1) exit 1; print fields }' "$checksum_path") || fail 'checksum asset must contain exactly one line'
+[ "$checksum_fields" = 2 ] || fail 'checksum asset must contain exactly a digest and file name'
+sidecar_archive_sha256=$(awk 'NR == 1 { print $1; exit }' "$checksum_path" | tr '[:upper:]' '[:lower:]')
+sidecar_archive_name=$(awk 'NR == 1 { name = $2; sub(/\r$/, "", name); print name; exit }' "$checksum_path")
+case "$sidecar_archive_name" in \*) sidecar_archive_name=${sidecar_archive_name#\*} ;; esac
+require_sha256 "$sidecar_archive_sha256" 'release checksum digest'
+[ "$sidecar_archive_name" = "$archive_name" ] || fail 'release checksum names a different archive'
+[ "$sidecar_archive_sha256" = "$archive_sha256" ] || fail 'release checksum disagrees with the lock'
+
+python3 "$verifier" --archive "$archive_path" --format "$archive_format" \
+  --entry "$executable" --extract-to "$runtime_dir"
+export OLLAMA_CORTIQ_PATH="$runtime_dir/$executable"
+test -x "$OLLAMA_CORTIQ_PATH"
+printf 'verified Cortiq runtime: %s\n' "$OLLAMA_CORTIQ_PATH"
+```
+
+The lock currently has Unix artifacts for Linux `amd64`, macOS `amd64`, and
+macOS `arm64`. Linux `arm64` is deliberately rejected because the pinned CMF
+release has no reviewed runtime for that build target. See the
+[platform matrix](docs/cmf.md#platform-and-runtime-scope) for Windows and
+evidence boundaries.
+
+### 3. Start an isolated fork server
+
+Use a distinct port and model directory so the test cannot accidentally talk to
+an already-running official Ollama server or alter its model store.
+
+```sh
+export OLLAMA_HOST=127.0.0.1:11456
+export OLLAMA_MODELS="$(pwd)/.ollamacmf-models"
 "$OLLAMA_BIN" serve
 ```
 
-In another terminal (export `OLLAMA_BIN` there too), import a local CMF file
-with a Modelfile and use `"$OLLAMA_BIN" create ...` / `"$OLLAMA_BIN" run ...`.
-Verify the runtime archive using [the CMF engine contract](docs/cmf-engine.md)
-before setting `OLLAMA_CORTIQ_PATH`; that contract also covers import, API
-routing, compatibility, and release procedures. Do not expose or connect
-directly to the ephemeral Cortiq sidecar port.
+Keep that terminal open. `OLLAMA_CORTIQ_PATH` is read by the server process, so
+set it **before** starting the server.
 
-## Documentation
+### 4. Import the checked-in test fixture and call the Ollama API
 
-- [CLI reference](https://docs.ollama.com/cli)
-- [REST API reference](https://docs.ollama.com/api)
-- [Importing models](https://docs.ollama.com/import)
-- [Modelfile reference](https://docs.ollama.com/modelfile)
-- [Building from source](https://github.com/ollama/ollama/blob/main/docs/development.md)
+In a second terminal in the same checkout:
 
-## Community Integrations
+```sh
+export OLLAMA_BIN="$(pwd)/ollamacmf"
+export OLLAMA_HOST=127.0.0.1:11456
+fixture="$(pwd)/testdata/cmf/tiny-v0.8.19.cmf"
+printf 'FROM %s\nPARAMETER temperature 0\nPARAMETER num_predict 2\n' "$fixture" \
+  > /tmp/Modelfile.cmf
 
-> Want to add your project? Open a pull request.
+"$OLLAMA_BIN" create cmf-smoke -f /tmp/Modelfile.cmf
+curl --fail --silent http://127.0.0.1:11456/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"cmf-smoke","messages":[{"role":"user","content":"Hello"}],"stream":false,"options":{"num_predict":2}}'
+printf '\n'
+```
 
-### Chat Interfaces
+The fixture is intentionally tiny with random weights: a successful response
+checks the integration contract, **not model quality**. Replace its absolute
+path in the Modelfile with a trusted, runnable CMF v2 generative text model for
+real use; see [obtaining a CMF model](docs/cmf.md#obtaining-a-cmf-model) for
+the separate upstream conversion/model guidance and its boundaries. To clean
+up, run `"$OLLAMA_BIN" rm cmf-smoke` while the server is
+still available, then stop the server and remove `.ollamacmf-models` and
+`.runtime` if they were created only for the smoke test.
 
-#### Web
+For a Windows PowerShell flow, a real-model example, troubleshooting, and the
+full compatibility matrix, start with the [CMF/Cortiq guide](docs/cmf.md).
 
-- [Open WebUI](https://github.com/open-webui/open-webui) - Extensible, self-hosted AI interface
-- [Onyx](https://github.com/onyx-dot-app/onyx) - Connected AI workspace
-- [LibreChat](https://github.com/danny-avila/LibreChat) - Enhanced ChatGPT clone with multi-provider support
-- [Lobe Chat](https://github.com/lobehub/lobe-chat) - Modern chat framework with plugin ecosystem ([docs](https://lobehub.com/docs/self-hosting/examples/ollama))
-- [NextChat](https://github.com/ChatGPTNextWeb/ChatGPT-Next-Web) - Cross-platform ChatGPT UI ([docs](https://docs.nextchat.dev/models/ollama))
-- [Perplexica](https://github.com/ItzCrazyKns/Perplexica) - AI-powered search engine, open-source Perplexity alternative
-- [big-AGI](https://github.com/enricoros/big-AGI) - AI suite for professionals
-- [Lollms WebUI](https://github.com/ParisNeo/lollms-webui) - Multi-model web interface
-- [ChatOllama](https://github.com/sugarforever/chat-ollama) - Chatbot with knowledge bases
-- [Bionic GPT](https://github.com/bionic-gpt/bionic-gpt) - On-premise AI platform
-- [Chatbot UI](https://github.com/ivanfioravanti/chatbot-ollama) - ChatGPT-style web interface
-- [Hollama](https://github.com/fmaclen/hollama) - Minimal web interface
-- [Chatbox](https://github.com/Bin-Huang/Chatbox) - Desktop and web AI client
-- [chat](https://github.com/swuecho/chat) - Chat web app for teams
-- [Ollama RAG Chatbot](https://github.com/datvodinh/rag-chatbot.git) - Chat with multiple PDFs using RAG
-- [Tkinter-based client](https://github.com/chyok/ollama-gui) - Python desktop client
+## Compatibility and intentional boundaries
 
-#### Desktop
+CMF is **not** a generic replacement for every Ollama feature. Current CMF
+models advertise completion capability only. The fork rejects embeddings,
+tokenization/detokenization, rendered templates, images/media, structured
+output, log probabilities, tool calls, and positive thinking requests rather
+than silently ignoring them. Model `PARAMETER` accepts only `temperature` and
+`num_predict`; request options are a deliberately smaller adapter surface than
+Cortiq's own HTTP API. See exact behavior and known resource limits in
+[CMF/Cortiq guide](docs/cmf.md#compatibility-and-limits).
 
-- [Dify.AI](https://github.com/langgenius/dify) - LLM app development platform
-- [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm) - All-in-one AI app for Mac, Windows, and Linux
-- [Maid](https://github.com/Mobile-Artificial-Intelligence/maid) - Cross-platform mobile and desktop client
-- [Witsy](https://github.com/nbonamy/witsy) - AI desktop app for Mac, Windows, and Linux
-- [Cherry Studio](https://github.com/kangfenmao/cherry-studio) - Multi-provider desktop client
-- [Ollama App](https://github.com/JHubi1/ollama-app) - Multi-platform client for desktop and mobile
-- [PyGPT](https://github.com/szczyglis-dev/py-gpt) - AI desktop assistant for Linux, Windows, and Mac
-- [Alpaca](https://github.com/Jeffser/Alpaca) - GTK4 client for Linux and macOS
-- [SwiftChat](https://github.com/aws-samples/swift-chat) - Cross-platform including iOS, Android, and Apple Vision Pro
-- [Enchanted](https://github.com/AugustDev/enchanted) - Native macOS and iOS client
-- [RWKV-Runner](https://github.com/josStorer/RWKV-Runner) - Multi-model desktop runner
-- [Ollama Grid Search](https://github.com/dezoito/ollama-grid-search) - Evaluate and compare models
-- [macai](https://github.com/Renset/macai) - macOS client for Ollama and ChatGPT
-- [AI Studio](https://github.com/MindWorkAI/AI-Studio) - Multi-provider desktop IDE
-- [Reins](https://github.com/ibrahimcetin/reins) - Parameter tuning and reasoning model support
-- [ConfiChat](https://github.com/1runeberg/confichat) - Privacy-focused with optional encryption
-- [LLocal.in](https://github.com/kartikm7/llocal) - Electron desktop client
-- [MindMac](https://mindmac.app) - AI chat client for Mac
-- [Msty](https://msty.app) - Multi-model desktop client
-- [BoltAI for Mac](https://boltai.com) - AI chat client for Mac
-- [IntelliBar](https://intellibar.app/) - AI-powered assistant for macOS
-- [Kerlig AI](https://www.kerlig.com/) - AI writing assistant for macOS
-- [Hillnote](https://hillnote.com) - Markdown-first AI workspace
-- [Perfect Memory AI](https://www.perfectmemory.ai/) - Productivity AI personalized by screen and meeting history
+The registered-runtime path is also intentionally narrow:
 
-#### Mobile
+- A CMF model is imported locally from one absolute file; it is not pulled from
+  or pushed to a registry.
+- `OLLAMA_CORTIQ_PATH` must be an absolute executable path. The optional
+  `OLLAMA_CORTIQ_ALLOW_PATH=1` fallback is for local development only.
+- The current adapter has no reliable CMF GPU-memory accounting. CMF loading is
+  exclusive with other runners; in normal server flow the scheduler supplies
+  one slot, so `CMF_SERVE_SLOTS` is one unless an explicit positive value is
+  supplied.
 
-- [Ollama Android Chat](https://github.com/sunshine0523/OllamaServer) - One-click Ollama on Android
+## Runtime intake and release policy
 
-> SwiftChat, Enchanted, Maid, Ollama App, Reins, and ConfiChat listed above also support mobile platforms.
+[`Intake verified CMF runtime update`](.github/workflows/cmf-release-sync.yml)
+runs on a four-hour reconciliation schedule (`17 */4 * * *`) or a
+`cmf-release` repository dispatch. It validates a complete, bounded set of
+upstream release assets and checksums, then opens a create-only candidate branch
+and PR that change only `cmf.lock.json`.
 
-### Code Editors & Development
+That is **candidate intake, not automatic binary publishing**. The workflow
+never embeds Cortiq into an Ollama payload, publishes a Docker image, tags an
+`ollamacmf` release, or changes a `latest` release. A separate protected
+promotion/publishing pipeline is still required after human review, runtime
+E2E, license/provenance review, and platform signing/notarization. The
+[automation runbook](docs/cmf-release-automation.md) describes the exact
+current behavior and the required next gate without claiming an unimplemented
+release system.
 
-- [Cline](https://github.com/cline/cline) - VS Code extension for multi-file/whole-repo coding
-- [Continue](https://github.com/continuedev/continue) - Open-source AI code assistant for any IDE
-- [Void](https://github.com/voideditor/void) - Open source AI code editor, Cursor alternative
-- [Copilot for Obsidian](https://github.com/logancyang/obsidian-copilot) - AI assistant for Obsidian
-- [twinny](https://github.com/rjmacarthy/twinny) - Copilot and Copilot chat alternative
-- [gptel Emacs client](https://github.com/karthink/gptel) - LLM client for Emacs
-- [Ollama Copilot](https://github.com/bernardo-bruning/ollama-copilot) - Use Ollama as GitHub Copilot
-- [Obsidian Local GPT](https://github.com/pfrankov/obsidian-local-gpt) - Local AI for Obsidian
-- [Ellama Emacs client](https://github.com/s-kostyaev/ellama) - LLM tool for Emacs
-- [orbiton](https://github.com/xyproto/orbiton) - Config-free text editor with Ollama tab completion
-- [AI ST Completion](https://github.com/yaroslavyaroslav/OpenAI-sublime-text) - Sublime Text 4 AI assistant
-- [VT Code](https://github.com/vinhnx/vtcode) - Rust-based terminal coding agent with Tree-sitter
-- [QodeAssist](https://github.com/Palm1r/QodeAssist) - AI coding assistant for Qt Creator
-- [AI Toolkit for VS Code](https://aka.ms/ai-tooklit/ollama-docs) - Microsoft-official VS Code extension
-- [Open Interpreter](https://docs.openinterpreter.com/language-model-setup/local-models/ollama) - Natural language interface for computers
-- [oxi](https://github.com/maziluiosif/oxi) - Native Rust desktop coding agent with editor, Git panel and terminal
+## Documentation map
 
-### Libraries & SDKs
+| Document | Use it for |
+| --- | --- |
+| [CMF/Cortiq guide](docs/cmf.md) | First install, import, requests, compatibility, security, and troubleshooting |
+| [CMF engine contract](docs/cmf-engine.md) | Maintainer-facing runner, lock, and packaging invariants |
+| [CMF release automation](docs/cmf-release-automation.md) | Candidate intake workflow and what it deliberately does not publish |
+| [Development guide](docs/development.md) | Native Ollama build prerequisites and CI |
+| [Base Ollama documentation](https://docs.ollama.com) | General upstream behavior; it does **not** document this CMF adapter |
 
-- [LiteLLM](https://github.com/BerriAI/litellm) - Unified API for 100+ LLM providers
-- [Semantic Kernel](https://github.com/microsoft/semantic-kernel/tree/main/python/semantic_kernel/connectors/ai/ollama) - Microsoft AI orchestration SDK
-- [LangChain4j](https://github.com/langchain4j/langchain4j) - Java LangChain ([example](https://github.com/langchain4j/langchain4j-examples/tree/main/ollama-examples/src/main/java))
-- [LangChainGo](https://github.com/tmc/langchaingo/) - Go LangChain ([example](https://github.com/tmc/langchaingo/tree/main/examples/ollama-completion-example))
-- [Spring AI](https://github.com/spring-projects/spring-ai) - Spring framework AI support ([docs](https://docs.spring.io/spring-ai/reference/api/chat/ollama-chat.html))
-- [LangChain](https://python.langchain.com/docs/integrations/chat/ollama/) and [LangChain.js](https://js.langchain.com/docs/integrations/chat/ollama/) with [example](https://js.langchain.com/docs/tutorials/local_rag/)
-- [Ollama for Ruby](https://github.com/crmne/ruby_llm) - Ruby LLM library
-- [any-llm](https://github.com/mozilla-ai/any-llm) - Unified LLM interface by Mozilla
-- [OllamaSharp for .NET](https://github.com/awaescher/OllamaSharp) - .NET SDK
-- [LangChainRust](https://github.com/Abraxas-365/langchain-rust) - Rust LangChain ([example](https://github.com/Abraxas-365/langchain-rust/blob/main/examples/llm_ollama.rs))
-- [Agents-Flex for Java](https://github.com/agents-flex/agents-flex) - Java agent framework ([example](https://github.com/agents-flex/agents-flex/tree/main/agents-flex-chat/agents-flex-chat-ollama))
-- [Elixir LangChain](https://github.com/brainlid/langchain) - Elixir LangChain
-- [Ollama-rs for Rust](https://github.com/pepperoni21/ollama-rs) - Rust SDK
-- [LangChain for .NET](https://github.com/tryAGI/LangChain) - .NET LangChain ([example](https://github.com/tryAGI/LangChain/blob/main/examples/LangChain.Samples.OpenAI/Program.cs))
-- [chromem-go](https://github.com/philippgille/chromem-go) - Go vector database with Ollama embeddings ([example](https://github.com/philippgille/chromem-go/tree/v0.5.0/examples/rag-wikipedia-ollama))
-- [LangChainDart](https://github.com/davidmigloz/langchain_dart) - Dart LangChain
-- [LlmTornado](https://github.com/lofcz/llmtornado) - Unified C# interface for multiple inference APIs
-- [Ollama4j for Java](https://github.com/ollama4j/ollama4j) - Java SDK
-- [Ollama for Laravel](https://github.com/cloudstudio/ollama-laravel) - Laravel integration
-- [Ollama for Swift](https://github.com/mattt/ollama-swift) - Swift SDK
-- [LlamaIndex](https://docs.llamaindex.ai/en/stable/examples/llm/ollama/) and [LlamaIndexTS](https://developers.llamaindex.ai/typescript/framework/modules/models/llms/ollama/) - Data framework for LLM apps
-- [Haystack](https://github.com/deepset-ai/haystack-integrations/blob/main/integrations/ollama.md) - AI pipeline framework
-- [Firebase Genkit](https://firebase.google.com/docs/genkit/plugins/ollama) - Google AI framework
-- [Ollama-hpp for C++](https://github.com/jmont-dev/ollama-hpp) - C++ SDK
-- [PromptingTools.jl](https://github.com/svilupp/PromptingTools.jl) - Julia LLM toolkit ([example](https://svilupp.github.io/PromptingTools.jl/dev/examples/working_with_ollama))
-- [Ollama for R - rollama](https://github.com/JBGruber/rollama) - R SDK
-- [Portkey](https://portkey.ai/docs/welcome/integration-guides/ollama) - AI gateway
-- [Testcontainers](https://testcontainers.com/modules/ollama/) - Container-based testing
-- [LLPhant](https://github.com/theodo-group/LLPhant?tab=readme-ov-file#ollama) - PHP AI framework
+## Contributing, security, and upstream
 
-### Frameworks & Agents
+Please report fork bugs and feature proposals in the
+[ollamacmf issue tracker](https://github.com/infosave2007/ollamacmf/issues) and
+read [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately using
+the [fork's GitHub Security Advisories](https://github.com/infosave2007/ollamacmf/security/advisories/new);
+do not send fork-specific reports to Ollama, Inc.
 
-- [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT/blob/master/docs/platform/ollama.md) - Autonomous AI agent platform
-- [crewAI](https://github.com/crewAIInc/crewAI) - Multi-agent orchestration framework
-- [Strands Agents](https://github.com/strands-agents/sdk-python) - Model-driven agent building by AWS
-- [Cheshire Cat](https://github.com/cheshire-cat-ai/core) - AI assistant framework
-- [any-agent](https://github.com/mozilla-ai/any-agent) - Unified agent framework interface by Mozilla
-- [Stakpak](https://github.com/stakpak/agent) - Open source DevOps agent
-- [Hexabot](https://github.com/hexastack/hexabot) - Conversational AI builder
-- [Neuro SAN](https://github.com/cognizant-ai-lab/neuro-san-studio) - Multi-agent orchestration ([docs](https://github.com/cognizant-ai-lab/neuro-san-studio/blob/main/docs/user_guide.md#ollama))
-
-### RAG & Knowledge Bases
-
-- [RAGFlow](https://github.com/infiniflow/ragflow) - RAG engine based on deep document understanding
-- [R2R](https://github.com/SciPhi-AI/R2R) - Open-source RAG engine
-- [MaxKB](https://github.com/1Panel-dev/MaxKB/) - Ready-to-use RAG chatbot
-- [Minima](https://github.com/dmayboroda/minima) - On-premises or fully local RAG
-- [Chipper](https://github.com/TilmanGriesel/chipper) - AI interface with Haystack RAG
-- [ARGO](https://github.com/xark-argo/argo) - RAG and deep research on Mac/Windows/Linux
-- [Archyve](https://github.com/nickthecook/archyve) - RAG-enabling document library
-- [Casibase](https://casibase.org) - AI knowledge base with RAG and SSO
-- [BrainSoup](https://www.nurgo-software.com/products/brainsoup) - Native client with RAG and multi-agent automation
-
-### Bots & Messaging
-
-- [LangBot](https://github.com/RockChinQ/LangBot) - Multi-platform messaging bots with agents and RAG
-- [AstrBot](https://github.com/AstrBotDevs/AstrBot/) - Multi-platform chatbot with RAG and plugins
-- [Discord-Ollama Chat Bot](https://github.com/kevinthedang/discord-ollama) - TypeScript Discord bot
-- [Ollama Telegram Bot](https://github.com/ruecat/ollama-telegram) - Telegram bot
-- [LLM Telegram Bot](https://github.com/innightwolfsleep/llm_telegram_bot) - Telegram bot for roleplay
-
-### Terminal & CLI
-
-- [aichat](https://github.com/sigoden/aichat) - All-in-one LLM CLI with Shell Assistant, RAG, and AI tools
-- [oterm](https://github.com/ggozad/oterm) - Terminal client for Ollama
-- [gollama](https://github.com/sammcj/gollama) - Go-based model manager for Ollama
-- [tlm](https://github.com/yusufcanb/tlm) - Local shell copilot
-- [tenere](https://github.com/pythops/tenere) - TUI for LLMs
-- [ParLlama](https://github.com/paulrobello/parllama) - TUI for Ollama
-- [llm-ollama](https://github.com/taketwo/llm-ollama) - Plugin for [Datasette's LLM CLI](https://llm.datasette.io/en/stable/)
-- [ShellOracle](https://github.com/djcopley/ShellOracle) - Shell command suggestions
-- [LLM-X](https://github.com/mrdjohnson/llm-x) - Progressive web app for LLMs
-- [cmdh](https://github.com/pgibler/cmdh) - Natural language to shell commands
-- [VT](https://github.com/vinhnx/vt.ai) - Minimal multimodal AI chat app
-
-### Productivity & Apps
-
-- [AppFlowy](https://github.com/AppFlowy-IO/AppFlowy) - AI collaborative workspace, self-hostable Notion alternative
-- [Screenpipe](https://github.com/mediar-ai/screenpipe) - 24/7 screen and mic recording with AI-powered search
-- [Vibe](https://github.com/thewh1teagle/vibe) - Transcribe and analyze meetings
-- [Page Assist](https://github.com/n4ze3m/page-assist) - Chrome extension for AI-powered browsing
-- [NativeMind](https://github.com/NativeMindBrowser/NativeMindExtension) - Private, on-device browser AI assistant
-- [Ollama Fortress](https://github.com/ParisNeo/ollama_proxy_server) - Security proxy for Ollama
-- [1Panel](https://github.com/1Panel-dev/1Panel/) - Web-based Linux server management
-- [Writeopia](https://github.com/Writeopia/Writeopia) - Text editor with Ollama integration
-- [QA-Pilot](https://github.com/reid41/QA-Pilot) - GitHub code repository understanding
-- [Raycast extension](https://github.com/MassimilianoPasquini97/raycast_ollama) - Ollama in Raycast
-- [Painting Droid](https://github.com/mateuszmigas/painting-droid) - Painting app with AI integrations
-- [Serene Pub](https://github.com/doolijb/serene-pub) - AI roleplaying app
-- [Mayan EDMS](https://gitlab.com/mayan-edms/mayan-edms) - Document management with Ollama workflows
-- [TagSpaces](https://www.tagspaces.org) - File management with [AI tagging](https://docs.tagspaces.org/ai/)
-
-### Observability & Monitoring
-
-- [Opik](https://www.comet.com/docs/opik/cookbook/ollama) - Debug, evaluate, and monitor LLM applications
-- [OpenLIT](https://github.com/openlit/openlit) - OpenTelemetry-native monitoring for Ollama and GPUs
-- [Lunary](https://lunary.ai/docs/integrations/ollama) - LLM observability with analytics and PII masking
-- [Langfuse](https://langfuse.com/docs/integrations/ollama) - Open source LLM observability
-- [HoneyHive](https://docs.honeyhive.ai/integrations/ollama) - AI observability and evaluation for agents
-- [MLflow Tracing](https://mlflow.org/docs/latest/llms/tracing/index.html#automatic-tracing) - Open source LLM observability
-
-### Database & Embeddings
-
-- [pgai](https://github.com/timescale/pgai) - PostgreSQL as a vector database ([guide](https://github.com/timescale/pgai/blob/main/docs/vectorizer-quick-start.md))
-- [MindsDB](https://docs.mindsdb.com/integrations/ai-engines/ollama) - Connect Ollama with 200+ data platforms
-- [chromem-go](https://github.com/philippgille/chromem-go/blob/v0.5.0/embed_ollama.go) - Embeddable vector database for Go ([example](https://github.com/philippgille/chromem-go/tree/v0.5.0/examples/rag-wikipedia-ollama))
-- [Kangaroo](https://github.com/dbkangaroo/kangaroo) - AI-powered SQL client
-
-### Infrastructure & Deployment
-
-#### Cloud
-
-- [Google Cloud](https://cloud.google.com/run/docs/tutorials/gpu-gemma2-with-ollama)
-- [Fly.io](https://fly.io/docs/python/do-more/add-ollama/)
-- [Koyeb](https://www.koyeb.com/deploy/ollama)
-- [Harbor](https://github.com/av/harbor) - Containerized LLM toolkit with Ollama as default backend
-
-#### Package Managers
-
-- [Pacman](https://archlinux.org/packages/extra/x86_64/ollama/)
-- [Homebrew](https://formulae.brew.sh/formula/ollama)
-- [Nix package](https://search.nixos.org/packages?show=ollama&from=0&size=50&sort=relevance&type=packages&query=ollama)
-- [Helm Chart](https://artifacthub.io/packages/helm/ollama-helm/ollama)
-- [Gentoo](https://github.com/gentoo/gentoo/tree/master/sci-ml/ollama)
-- [Flox](https://flox.dev/blog/ollama-part-one)
-- [Guix channel](https://codeberg.org/tusharhero/ollama-guix)
+This project is distributed under the [MIT License](LICENSE) inherited from
+Ollama. The reviewed Cortiq runtime inputs and the test fixture are recorded as
+Apache-2.0 in [cmf.lock.json](cmf.lock.json). Keep the relevant third-party
+notices with any future runtime distribution.
