@@ -473,7 +473,9 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ninja-build
-          cmake -S . -B build/native-cpu-smoke -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # The outer target delegates to a nested llama.cpp build. Bound that
+          # build explicitly as well so the hosted runner is not overcommitted.
+          cmake -S . -B build/native-cpu-smoke -G Ninja -DCMAKE_BUILD_TYPE=Release -DOLLAMA_BUILD_PARALLEL=2
           cmake --build build/native-cpu-smoke --target ollama-local --parallel 2
           test -x build/native-cpu-smoke/lib/ollama/llama-server
           test -x build/native-cpu-smoke/lib/ollama/llama-quantize
@@ -511,7 +513,9 @@ jobs:
           # default (which would use a Debug configuration by default).
           $env:CMAKE_GENERATOR = 'Ninja'
           $buildDir = 'build/native-cpu-smoke'
-          cmake -S . -B $buildDir -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # Keep the nested native build bounded too; the outer --parallel flag
+          # does not propagate through the ExternalProject invocation.
+          cmake -S . -B $buildDir -G Ninja -DCMAKE_BUILD_TYPE=Release -DOLLAMA_BUILD_PARALLEL=2
           cmake --build $buildDir --target ollama-local --parallel 2
           if (!(Test-Path "$buildDir\lib\ollama\llama-server.exe")) {
             throw 'missing llama-server.exe'
