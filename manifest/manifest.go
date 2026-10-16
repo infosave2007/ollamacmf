@@ -35,9 +35,11 @@ const (
 	RunnerMLX      = "mlx"
 	RunnerGGML     = "ggml"
 	RunnerLlamaCPP = "llamacpp"
+	RunnerCMF      = "cmf"
 
 	FormatSafetensors = "safetensors"
 	FormatGGUF        = "gguf"
+	FormatCMF         = "cmf"
 )
 
 type Manifest struct {
@@ -853,10 +855,10 @@ func selectManifestReferenceWithPreferences(manifests []Manifest, preferences []
 
 func runnerPreferences() []string {
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-		return []string{RunnerMLX, RunnerLlamaCPP, RunnerGGML}
+		return []string{RunnerMLX, RunnerLlamaCPP, RunnerGGML, RunnerCMF}
 	}
 
-	return []string{RunnerLlamaCPP, RunnerGGML, RunnerMLX}
+	return []string{RunnerLlamaCPP, RunnerGGML, RunnerMLX, RunnerCMF}
 }
 
 // IsTopRunnerPreference reports whether runner is the first runner the
@@ -875,7 +877,17 @@ func runnerPreferencesFor(runner string) []string {
 }
 
 func canonicalRunner(runner string) string {
-	return strings.ToLower(strings.TrimSpace(runner))
+	runner = strings.ToLower(strings.TrimSpace(runner))
+	// The public API accepts these historical/development names for the CMF
+	// sidecar. Manifest-list selection must canonicalize them too; otherwise a
+	// locally stored or remote child declared as "cortiq" cannot be selected by
+	// a request normalized to the canonical "cmf" runner.
+	switch runner {
+	case "cmfrunner", "cmf-runner", "cmf_runner", "cortiq":
+		return RunnerCMF
+	default:
+		return runner
+	}
 }
 
 // MetadataForConfig returns the default manifest-list runner and weight format
@@ -888,6 +900,8 @@ func MetadataForConfig(config model.ConfigV2) (runner, format string) {
 		return RunnerMLX, FormatSafetensors
 	case FormatGGUF, "ggml":
 		return RunnerGGML, FormatGGUF
+	case FormatCMF:
+		return RunnerCMF, FormatCMF
 	default:
 		return "", strings.ToLower(config.ModelFormat)
 	}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/fs/gguf"
@@ -19,6 +20,7 @@ import (
 type modelLayer struct {
 	manifest.Layer
 	GGUF           *gguf.Metadata
+	CMF            bool // true when this layer is an opaque CMF model blob
 	parameterCount uint64
 	splitFile      string
 	splitLayers    []manifest.Layer
@@ -57,6 +59,7 @@ func parseFromModel(ctx context.Context, name model.Name, fn func(api.ProgressRe
 	}
 
 	var layers []*modelLayer
+	isCMF := strings.EqualFold(config.ModelFormat, manifest.FormatCMF)
 	for _, srcLayer := range m.Layers {
 		layer, err := manifest.NewLayerFromLayer(srcLayer.Digest, srcLayer.MediaType, name.DisplayShortest())
 		if err != nil {
@@ -66,6 +69,16 @@ func parseFromModel(ctx context.Context, name model.Name, fn func(api.ProgressRe
 
 		if layer.MediaType == "application/vnd.ollama.image.adapter" {
 			slog.Warn("LoRA adapters are deprecated; the adapter layer is carried over but new adapters cannot be created", "model", name.DisplayShortest(), "digest", layer.Digest)
+		}
+		// CMF is an opaque, runner-native model container. Unlike GGUF it does
+		// not expose Ollama-readable metadata, so preserve every layer without
+		// trying to decode it as GGUF while creating a derived model.
+		if isCMF {
+			layers = append(layers, &modelLayer{
+				Layer: layer,
+				CMF:   layer.MediaType == manifest.MediaTypeImageModel,
+			})
+			continue
 		}
 		switch layer.MediaType {
 		case "application/vnd.ollama.image.model",

@@ -142,6 +142,14 @@ console.log(response.message.content);
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) project founded by Georgi Gerganov.
 
+## CMF engine bootstrap
+
+This fork contains an experimental local CMF/Cortiq sidecar adapter. It is not
+bundled in a public release or advertised as production support; its current
+trusted-single-user-host limitation, pinned runtime inputs, verification rules,
+and candidate-only release policy are documented in
+[the CMF engine contract](docs/cmf-engine.md).
+
 ## Documentation
 
 - [CLI reference](https://docs.ollama.com/cli)

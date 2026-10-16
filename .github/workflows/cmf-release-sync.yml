@@ -1,0 +1,725 @@
+name: Intake verified CMF runtime update
+
+on:
+  # A CMF release event is only a wake-up signal. This workflow independently
+  # resolves and verifies the release before proposing a lock update.
+  repository_dispatch:
+    types: [cmf-release]
+  # CMF assets can appear after the release becomes visible. This reconciles a
+  # missed dispatch or a temporarily incomplete asset matrix without publishing.
+  schedule:
+    - cron: '17 */4 * * *'
+
+# Validation handles untrusted upstream metadata and archives, so the
+# workflow default is deliberately read-only. The isolated PR job below is the
+# sole write-capable boundary.
+permissions:
+  contents: read
+
+concurrency:
+  group: cmf-runtime-intake
+  cancel-in-progress: false
+
+env:
+  CMF_REPOSITORY: infosave2007/cmf
+  CMF_LOCK_FILE: cmf.lock.json
+  CMF_CANDIDATE_BRANCH_PREFIX: automation/cmf-runtime
+  CMF_MAX_ARCHIVE_BYTES: "536870912"
+  CMF_MAX_CHECKSUM_BYTES: "4096"
+
+jobs:
+  intake:
+    # This job parses release metadata and upstream archives, but has no write
+    # token and never executes an upstream runtime.
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.cmf.outputs.ready }}
+      tag: ${{ steps.cmf.outputs.tag }}
+      source_commit: ${{ steps.cmf.outputs.source_commit }}
+      candidate_branch: ${{ steps.cmf.outputs.candidate_branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # actions/checkout v4.4.0, pinned to its immutable commit.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Discover and verify the complete CMF desktop matrix
+        id: cmf
+        shell: bash
+        env:
+          # Used only for GitHub API rate limits; release downloads never carry
+          # this token.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$*" >&2
+            exit 1
+          }
+
+          # Missing assets are normal while an upstream release is being
+          # assembled. Keep the checked-out lock unchanged and retry later.
+          not_ready() {
+            echo "::notice::$*"
+            {
+              echo 'ready=false'
+              echo "reason=$*"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          require_sha256() {
+            local value="$1"
+            local label="$2"
+            [[ "$value" =~ ^[0-9A-Fa-f]{64}$ ]] || fail "${label} is not a SHA-256 digest"
+            printf '%s\n' "$value" | tr '[:upper:]' '[:lower:]'
+          }
+
+          require_size_at_most() {
+            local value="$1"
+            local limit="$2"
+            local label="$3"
+            [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "${label} is not a positive integer"
+            # Compare decimal strings so maliciously large JSON numbers cannot
+            # overflow shell arithmetic before the download is refused.
+            if (( ${#value} > ${#limit} )) || \
+              { (( ${#value} == ${#limit} )) && [[ "$value" > "$limit" ]]; }; then
+              fail "${label} is ${value} bytes, above the ${limit}-byte limit"
+            fi
+          }
+
+          verify_api_digest() {
+            local api_digest="$1"
+            local actual="$2"
+            local label="$3"
+            # GitHub's asset digest is an independent, useful check when the
+            # API supplies it. Older releases may not expose this field.
+            if [[ -z "$api_digest" ]]; then
+              echo "GitHub API did not provide a digest for ${label}; using its release checksum asset" >&2
+              return 0
+            fi
+            [[ "$api_digest" =~ ^sha256:([0-9A-Fa-f]{64})$ ]] || fail "unexpected GitHub API digest for ${label}: ${api_digest}"
+            local expected
+            expected="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+            [[ "$expected" == "$actual" ]] || fail "GitHub API digest mismatch for ${label}"
+          }
+
+          api_get() {
+            local -a headers=(
+              --header 'Accept: application/vnd.github+json'
+              --header 'X-GitHub-Api-Version: 2022-11-28'
+            )
+            if [[ -n "${GH_TOKEN:-}" ]]; then
+              headers+=(--header "Authorization: Bearer ${GH_TOKEN}")
+            fi
+            curl --fail --silent --show-error --location \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 90 \
+              "${headers[@]}" "$1"
+          }
+
+          api_get_status() {
+            local destination="$1"
+            local url="$2"
+            local -a headers=(
+              --header 'Accept: application/vnd.github+json'
+              --header 'X-GitHub-Api-Version: 2022-11-28'
+            )
+            if [[ -n "${GH_TOKEN:-}" ]]; then
+              headers+=(--header "Authorization: Bearer ${GH_TOKEN}")
+            fi
+            curl --silent --show-error --location \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 90 \
+              --output "$destination" --write-out '%{http_code}' \
+              "${headers[@]}" "$url"
+          }
+
+          download_asset() {
+            local url="$1"
+            local destination="$2"
+            local maximum_bytes="$3"
+            curl --fail --silent --show-error --location \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 600 \
+              --max-filesize "$maximum_bytes" \
+              --output "$destination" "$url"
+          }
+
+          asset_count() {
+            local name="$1"
+            jq -er --arg name "$name" '[.assets[] | select(.name == $name)] | length' "$release_json"
+          }
+
+          asset_field() {
+            local name="$1"
+            local field="$2"
+            jq -er --arg name "$name" --arg field "$field" \
+              '[.assets[] | select(.name == $name)] | .[0] | .[$field]' "$release_json"
+          }
+
+          command -v curl >/dev/null || fail 'curl is required'
+          command -v jq >/dev/null || fail 'jq is required'
+          command -v sha256sum >/dev/null || fail 'sha256sum is required'
+          command -v python3 >/dev/null || fail 'python3 is required'
+          [[ -f .github/scripts/verify_cmf_runtime_archive.py ]] || fail 'CMF archive verifier is missing'
+
+          workdir="${RUNNER_TEMP}/cmf-runtime-intake-${GITHUB_RUN_ID}"
+          mkdir -p "$workdir"
+          release_json="${workdir}/release.json"
+          api_get "https://api.github.com/repos/${CMF_REPOSITORY}/releases/latest" > "$release_json"
+
+          tag="$(jq -er '.tag_name' "$release_json")"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "latest CMF release tag is not stable vMAJOR.MINOR.PATCH: ${tag}"
+          [[ "$(jq -er '.draft | not' "$release_json")" == 'true' ]] || fail "latest CMF release ${tag} is a draft"
+          [[ "$(jq -er '.prerelease | not' "$release_json")" == 'true' ]] || fail "latest CMF release ${tag} is a prerelease"
+          release_id="$(jq -er '.id' "$release_json")"
+          [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || fail "invalid release id for ${tag}"
+          published_at="$(jq -er '.published_at' "$release_json")"
+          [[ "$published_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || fail "invalid published_at for ${tag}"
+          release_immutable="$(jq -r '.immutable | if type == "boolean" then . else error("immutable must be a boolean") end' "$release_json")"
+          [[ "$(jq -er '.html_url' "$release_json")" == "https://github.com/${CMF_REPOSITORY}/releases/tag/${tag}" ]] || fail "unexpected release URL for ${tag}"
+
+          # Require an annotated tag pointing directly at a commit. Its
+          # verification state is recorded, but unsigned tags are not promoted
+          # automatically; the documented public-release gate remains separate.
+          tag_ref_json="${workdir}/tag-ref.json"
+          api_get "https://api.github.com/repos/${CMF_REPOSITORY}/git/ref/tags/${tag}" > "$tag_ref_json"
+          [[ "$(jq -er '.object.type' "$tag_ref_json")" == 'tag' ]] || fail "CMF release ${tag} must use an annotated tag"
+          annotated_tag_object="$(jq -er '.object.sha' "$tag_ref_json")"
+          [[ "$annotated_tag_object" =~ ^[0-9a-f]{40}$ ]] || fail "invalid annotated tag object for ${tag}"
+          tag_object_json="${workdir}/tag-object.json"
+          api_get "https://api.github.com/repos/${CMF_REPOSITORY}/git/tags/${annotated_tag_object}" > "$tag_object_json"
+          [[ "$(jq -er '.object.type' "$tag_object_json")" == 'commit' ]] || fail "CMF tag ${tag} does not point directly to a commit"
+          source_commit="$(jq -er '.object.sha' "$tag_object_json")"
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || fail "invalid source commit for ${tag}"
+          tag_signature_verified="$(jq -r '.verification.verified | if type == "boolean" then . else error("verification state must be a boolean") end' "$tag_object_json")"
+          tag_signature_reason="$(jq -er '.verification.reason' "$tag_object_json")"
+          [[ -n "$tag_signature_reason" ]] || fail "CMF tag ${tag} has no verification reason"
+
+          # The candidate identity is stable for an exact upstream release
+          # input, but never shared by two releases. A later write job creates
+          # it with a non-force push, so this preflight is advisory rather than
+          # the security boundary against overwriting reviewer changes.
+          candidate_branch="${CMF_CANDIDATE_BRANCH_PREFIX}-${tag}-${source_commit:0:12}"
+          [[ "$candidate_branch" =~ ^automation/cmf-runtime-v[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12}$ ]] || fail "unsafe candidate branch name ${candidate_branch}"
+          candidate_head="$(printf '%s:%s' "$GITHUB_REPOSITORY_OWNER" "$candidate_branch" | jq -sRr @uri)"
+          open_candidates="${workdir}/open-candidates.json"
+          api_get "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls?state=open&head=${candidate_head}&per_page=1" > "$open_candidates"
+          open_count="$(jq -er 'length' "$open_candidates")"
+          [[ "$open_count" =~ ^[0-9]+$ ]] || fail 'unexpected CMF candidate PR response'
+          if [[ "$open_count" != '0' ]]; then
+            not_ready "an open CMF candidate PR already exists; leaving ${candidate_branch} untouched for review"
+          fi
+          candidate_ref="${workdir}/candidate-ref.json"
+          candidate_ref_status="$(api_get_status "$candidate_ref" "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/heads/${candidate_branch}")"
+          case "$candidate_ref_status" in
+            404) ;;
+            200) not_ready "CMF candidate branch ${candidate_branch} exists without an open PR; refusing to overwrite it" ;;
+            *) fail "unexpected status ${candidate_ref_status} while checking ${candidate_branch}" ;;
+          esac
+
+          # platform | upstream target | archive | format | sole executable entry
+          platform_specs=(
+            'linux/amd64|x86_64-unknown-linux-gnu|cortiq-x86_64-unknown-linux-gnu.tar.gz|tar.gz|cortiq'
+            'darwin/arm64|aarch64-apple-darwin|cortiq-aarch64-apple-darwin.tar.gz|tar.gz|cortiq'
+            'darwin/amd64|x86_64-apple-darwin|cortiq-x86_64-apple-darwin.tar.gz|tar.gz|cortiq'
+            'windows/amd64|x86_64-pc-windows-msvc|cortiq-x86_64-pc-windows-msvc.zip|zip|cortiq.exe'
+            'windows/arm64|aarch64-pc-windows-msvc|cortiq-aarch64-pc-windows-msvc.zip|zip|cortiq.exe'
+          )
+
+          # Do not silently widen the reviewed platform scope. A new native
+          # Linux arm64 asset requires an explicit lock/schema/docs review.
+          linux_arm64_archive='cortiq-aarch64-unknown-linux-gnu.tar.gz'
+          [[ "$(asset_count "$linux_arm64_archive")" == '0' ]] || fail "${tag} now has ${linux_arm64_archive}; add it only through a reviewed platform-scope change"
+
+          # Do this preflight separately so not_ready exits the top-level shell,
+          # rather than a command-substitution subshell.
+          for spec in "${platform_specs[@]}"; do
+            IFS='|' read -r platform target archive format executable <<< "$spec"
+            for asset in "$archive" "${archive}.sha256"; do
+              count="$(asset_count "$asset")"
+              if [[ "$count" == '0' ]]; then
+                not_ready "${tag} is not ready: missing ${asset} for ${platform}"
+              fi
+              [[ "$count" == '1' ]] || fail "${tag} has ${count} assets named ${asset}"
+            done
+          done
+
+          artifacts_ndjson="${workdir}/artifacts.ndjson"
+          : > "$artifacts_ndjson"
+          for spec in "${platform_specs[@]}"; do
+            IFS='|' read -r platform target archive format executable <<< "$spec"
+            checksum_asset="${archive}.sha256"
+            expected_archive_url="https://github.com/${CMF_REPOSITORY}/releases/download/${tag}/${archive}"
+            expected_checksum_url="https://github.com/${CMF_REPOSITORY}/releases/download/${tag}/${checksum_asset}"
+
+            archive_url="$(asset_field "$archive" browser_download_url)"
+            checksum_url="$(asset_field "$checksum_asset" browser_download_url)"
+            archive_id="$(asset_field "$archive" id)"
+            checksum_id="$(asset_field "$checksum_asset" id)"
+            archive_size="$(asset_field "$archive" size)"
+            checksum_size="$(asset_field "$checksum_asset" size)"
+            archive_state="$(asset_field "$archive" state)"
+            checksum_state="$(asset_field "$checksum_asset" state)"
+            archive_api_digest="$(jq -r --arg name "$archive" '[.assets[] | select(.name == $name)] | .[0].digest // empty' "$release_json")"
+            checksum_api_digest="$(jq -r --arg name "$checksum_asset" '[.assets[] | select(.name == $name)] | .[0].digest // empty' "$release_json")"
+
+            [[ "$archive_url" == "$expected_archive_url" ]] || fail "unexpected download URL for ${archive}"
+            [[ "$checksum_url" == "$expected_checksum_url" ]] || fail "unexpected download URL for ${checksum_asset}"
+            [[ "$archive_id" =~ ^[1-9][0-9]*$ && "$checksum_id" =~ ^[1-9][0-9]*$ ]] || fail "invalid asset id for ${platform}"
+            [[ "$archive_size" =~ ^[1-9][0-9]*$ && "$checksum_size" =~ ^[1-9][0-9]*$ ]] || fail "invalid asset size for ${platform}"
+            require_size_at_most "$archive_size" "$CMF_MAX_ARCHIVE_BYTES" "archive ${archive}"
+            require_size_at_most "$checksum_size" "$CMF_MAX_CHECKSUM_BYTES" "checksum ${checksum_asset}"
+            [[ "$archive_state" == 'uploaded' && "$checksum_state" == 'uploaded' ]] || not_ready "${tag} is not ready: ${platform} assets are not uploaded"
+
+            archive_path="${workdir}/${archive}"
+            checksum_path="${workdir}/${checksum_asset}"
+            download_asset "$archive_url" "$archive_path" "$CMF_MAX_ARCHIVE_BYTES"
+            download_asset "$checksum_url" "$checksum_path" "$CMF_MAX_CHECKSUM_BYTES"
+            [[ "$(wc -c < "$archive_path" | tr -d '[:space:]')" == "$archive_size" ]] || fail "downloaded ${archive} size differs from GitHub metadata"
+            [[ "$(wc -c < "$checksum_path" | tr -d '[:space:]')" == "$checksum_size" ]] || fail "downloaded ${checksum_asset} size differs from GitHub metadata"
+
+            archive_sha256="$(require_sha256 "$(sha256sum "$archive_path" | awk '{print $1}')" "$archive")"
+            checksum_asset_sha256="$(require_sha256 "$(sha256sum "$checksum_path" | awk '{print $1}')" "$checksum_asset")"
+            verify_api_digest "$archive_api_digest" "$archive_sha256" "$archive"
+            verify_api_digest "$checksum_api_digest" "$checksum_asset_sha256" "$checksum_asset"
+
+            [[ "$(awk 'END { print NR + 0 }' "$checksum_path")" == '1' ]] || fail "${checksum_asset} must contain exactly one checksum"
+            checksum_line="$(cat "$checksum_path")"
+            checksum_line="${checksum_line%$'\r'}"
+            read -r expected_archive_sha256 checksum_name extra <<< "$checksum_line"
+            [[ -n "${expected_archive_sha256:-}" && -n "${checksum_name:-}" && -z "${extra:-}" ]] || fail "malformed ${checksum_asset}"
+            expected_archive_sha256="$(require_sha256 "$expected_archive_sha256" "$checksum_asset")"
+            checksum_name="${checksum_name#\*}"
+            [[ "$checksum_name" == "$archive" ]] || fail "${checksum_asset} does not describe ${archive}"
+            [[ "$expected_archive_sha256" == "$archive_sha256" ]] || fail "${archive} does not match ${checksum_asset}"
+
+            # This read-only intake never extracts or executes an upstream
+            # payload. The shared verifier rejects links, special files,
+            # non-executables, unexpected entries, and oversized members.
+            env -u GH_TOKEN python3 .github/scripts/verify_cmf_runtime_archive.py \
+              --archive "$archive_path" --format "$format" --entry "$executable"
+
+            jq -n \
+              --arg platform "$platform" \
+              --arg target "$target" \
+              --arg archive "$archive" \
+              --arg archive_url "$archive_url" \
+              --argjson archive_id "$archive_id" \
+              --argjson archive_size "$archive_size" \
+              --arg archive_sha256 "$archive_sha256" \
+              --arg format "$format" \
+              --arg executable "$executable" \
+              --arg checksum_asset "$checksum_asset" \
+              --arg checksum_url "$checksum_url" \
+              --argjson checksum_id "$checksum_id" \
+              --argjson checksum_size "$checksum_size" \
+              --arg checksum_asset_sha256 "$checksum_asset_sha256" \
+              '{
+                platform: $platform,
+                upstreamTarget: $target,
+                status: "initial-packaging-scope",
+                archive: {
+                  name: $archive,
+                  url: $archive_url,
+                  releaseAssetId: $archive_id,
+                  sizeBytes: $archive_size,
+                  sha256: $archive_sha256,
+                  format: $format,
+                  entries: [$executable]
+                },
+                checksum: {
+                  name: $checksum_asset,
+                  url: $checksum_url,
+                  releaseAssetId: $checksum_id,
+                  sizeBytes: $checksum_size,
+                  sha256: $checksum_asset_sha256
+                },
+                installedExecutable: $executable
+              }' >> "$artifacts_ndjson"
+          done
+
+          artifacts_json="${workdir}/artifacts.json"
+          jq -s '.' "$artifacts_ndjson" > "$artifacts_json"
+          # A runtime lock never invents or regenerates a model fixture. Keep
+          # the separately reviewed fixture record so a new runtime tag must
+          # receive an explicit fixture update before its PR can pass E2E.
+          [[ -f "$CMF_LOCK_FILE" ]] || fail "missing ${CMF_LOCK_FILE}; initialize the reviewed CMF fixture manually"
+          e2e_fixture="$(jq -ce '.e2eFixture | select(type == "object")' "$CMF_LOCK_FILE")" || fail "${CMF_LOCK_FILE} lacks a reviewed e2eFixture"
+          validated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          candidate_lock="${workdir}/${CMF_LOCK_FILE}"
+          jq -n \
+            --arg tag "$tag" \
+            --argjson release_id "$release_id" \
+            --arg published_at "$published_at" \
+            --argjson release_immutable "$release_immutable" \
+            --arg annotated_tag_object "$annotated_tag_object" \
+            --arg source_commit "$source_commit" \
+            --argjson tag_signature_verified "$tag_signature_verified" \
+            --arg tag_signature_reason "$tag_signature_reason" \
+            --arg validated_at "$validated_at" \
+            --argjson e2e_fixture "$e2e_fixture" \
+            --slurpfile artifacts "$artifacts_json" \
+            '{
+              schemaVersion: 1,
+              engine: {
+                name: "cortiq",
+                modelFormat: "cmf",
+                integrationStatus: "bootstrap"
+              },
+              e2eFixture: $e2e_fixture,
+              upstream: {
+                repository: "infosave2007/cmf",
+                license: "Apache-2.0",
+                release: {
+                  tag: $tag,
+                  id: $release_id,
+                  url: ("https://github.com/infosave2007/cmf/releases/tag/" + $tag),
+                  publishedAt: $published_at,
+                  draft: false,
+                  prerelease: false,
+                  immutable: $release_immutable
+                },
+                source: {
+                  annotatedTagObject: $annotated_tag_object,
+                  commit: $source_commit,
+                  tagSignature: {
+                    verified: $tag_signature_verified,
+                    reason: $tag_signature_reason
+                  }
+                }
+              },
+              artifacts: $artifacts[0],
+              unsupportedPlatforms: [
+                {
+                  platform: "linux/arm64",
+                  reason: ("CMF " + $tag + " does not publish cortiq-aarch64-unknown-linux-gnu.tar.gz."),
+                  policy: "Do not substitute an unpinned source build or another target artifact. Add this platform only through a new reviewed lock revision."
+                }
+              ],
+              validation: {
+                validatedAt: $validated_at,
+                checks: [
+                  "Fetched release and annotated-tag metadata from the GitHub APIs.",
+                  "Downloaded each listed desktop archive and its adjacent .sha256 asset from the pinned release.",
+                  "Verified every downloaded archive with its published SHA-256 checksum and GitHub API digest when available.",
+                  "Verified archive metadata: one regular executable payload only; no links, special files, or unexpected entries."
+                ],
+                provenance: "Transfer integrity is verified against release-provided checksums and GitHub API digests when available. Tag verification and release immutability state are recorded above; this lock is not a cryptographic provenance attestation."
+              }
+            }' > "$candidate_lock"
+
+          lock_identity() {
+            jq -S '{schemaVersion, engine, e2eFixture, upstream, artifacts, unsupportedPlatforms}' "$1"
+          }
+
+          if [[ -f "$CMF_LOCK_FILE" ]]; then
+            current_tag="$(jq -er '.upstream.release.tag' "$CMF_LOCK_FILE")"
+            [[ "$current_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "invalid tag in ${CMF_LOCK_FILE}: ${current_tag}"
+            if [[ "$current_tag" == "$tag" ]]; then
+              # Do not rewrite a lock just because validation time changed. Any
+              # other same-tag difference is evidence of a mutable upstream
+              # release/tag and must be reviewed, not silently accepted.
+              [[ "$(lock_identity "$CMF_LOCK_FILE")" == "$(lock_identity "$candidate_lock")" ]] || fail "CMF ${tag} differs from the existing lock; refusing a mutable same-tag update"
+              {
+                echo 'ready=false'
+                echo 'reason=the latest CMF release already matches the canonical lock'
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            newest="$(printf '%s\n%s\n' "${current_tag#v}" "${tag#v}" | sort -V | tail -n 1)"
+            [[ "$newest" == "${tag#v}" ]] || fail "latest CMF release ${tag} would downgrade ${CMF_LOCK_FILE} from ${current_tag}"
+          fi
+
+          candidate_dir="${workdir}/candidate"
+          mkdir -p "$candidate_dir"
+          cp "$candidate_lock" "$candidate_dir/$CMF_LOCK_FILE"
+          {
+            echo 'ready=true'
+            echo "tag=${tag}"
+            echo "source_commit=${source_commit}"
+            echo "candidate_branch=${candidate_branch}"
+          } >> "$GITHUB_OUTPUT"
+
+      # actions/upload-artifact v4, pinned to its immutable commit.
+      - name: Pass verified lock candidate to the isolated PR job
+        if: steps.cmf.outputs.ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cmf-runtime-lock-candidate
+          path: ${{ runner.temp }}/cmf-runtime-intake-${{ github.run_id }}/candidate/cmf.lock.json
+          if-no-files-found: error
+          retention-days: 1
+
+  create-candidate-pr:
+    # This job is the sole write-capable boundary. It consumes one bounded JSON
+    # artifact from the unprivileged intake job, validates its complete schema
+    # and identity again, and never downloads, extracts, parses, or executes an
+    # upstream archive.
+    needs: intake
+    if: needs.intake.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    env:
+      CMF_CANDIDATE_BRANCH: ${{ needs.intake.outputs.candidate_branch }}
+      CMF_CANDIDATE_TAG: ${{ needs.intake.outputs.tag }}
+      CMF_CANDIDATE_SOURCE_COMMIT: ${{ needs.intake.outputs.source_commit }}
+      CMF_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      # actions/checkout v4.4.0, pinned to its immutable commit. Credentials
+      # are retained only in this privileged job for the conditional ref push.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: true
+
+      # actions/download-artifact v4, pinned to its immutable commit.
+      - name: Retrieve the verified lock candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cmf-runtime-lock-candidate
+          path: .cmf-candidate
+
+      - name: Validate the isolated lock artifact and candidate identity
+        id: candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$*" >&2
+            exit 1
+          }
+
+          api_get_status() {
+            local destination="$1"
+            local url="$2"
+            curl --silent --show-error --location \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 90 \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --output "$destination" --write-out '%{http_code}' "$url"
+          }
+
+          command -v curl >/dev/null || fail 'curl is required'
+          command -v jq >/dev/null || fail 'jq is required'
+          [[ "$CMF_CANDIDATE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'intake emitted an invalid candidate tag'
+          [[ "$CMF_CANDIDATE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail 'intake emitted an invalid candidate source commit'
+          [[ "$CMF_CANDIDATE_BRANCH" =~ ^automation/cmf-runtime-v[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12}$ ]] || fail 'intake emitted an unsafe candidate branch'
+          [[ "$CMF_CANDIDATE_BRANCH" == *"-${CMF_CANDIDATE_SOURCE_COMMIT:0:12}" ]] || fail 'candidate branch does not match the source commit'
+          [[ ! -L .cmf-candidate/cmf.lock.json && -f .cmf-candidate/cmf.lock.json ]] || fail 'verified lock artifact must be a regular file, not a symlink'
+          candidate_bytes="$(wc -c < .cmf-candidate/cmf.lock.json | tr -d '[:space:]')"
+          [[ "$candidate_bytes" =~ ^[1-9][0-9]*$ && "$candidate_bytes" -le 262144 ]] || fail 'verified lock artifact has an unexpected size'
+
+          # The reviewed fixture is explicitly out of scope for automatic
+          # intake. A write-capable job must prove the artifact preserved it.
+          base_fixture="$(jq -cS '.e2eFixture' cmf.lock.json)" || fail 'base lock has no readable E2E fixture'
+          candidate_fixture="$(jq -cS '.e2eFixture' .cmf-candidate/cmf.lock.json)" || fail 'candidate lock has no readable E2E fixture'
+          [[ "$candidate_fixture" == "$base_fixture" ]] || fail 'candidate artifact changed the separately reviewed E2E fixture'
+
+          # Whitelist the candidate schema before it can become a committed
+          # file. The tag and resolved commit must be exactly the values output
+          # by the read-only intake job; no arbitrary fields are accepted.
+          jq -e --arg tag "$CMF_CANDIDATE_TAG" --arg commit "$CMF_CANDIDATE_SOURCE_COMMIT" '
+            def exact_keys($expected): (keys | sort) == ($expected | sort);
+            def posint: type == "number" and floor == . and . > 0;
+            def sha256: type == "string" and test("^[0-9a-f]{64}$");
+            def archive:
+              type == "object" and exact_keys(["name", "url", "releaseAssetId", "sizeBytes", "sha256", "format", "entries"]) and
+              (.name | type == "string" and test("^cortiq-[A-Za-z0-9._-]+\\.(tar\\.gz|zip)$")) and
+              (.url == ("https://github.com/infosave2007/cmf/releases/download/" + $tag + "/" + .name)) and
+              (.releaseAssetId | posint) and (.sizeBytes | posint and . <= 536870912) and
+              (.sha256 | sha256) and (.format == "tar.gz" or .format == "zip") and
+              (.entries | type == "array" and length == 1 and (.[0] | type == "string" and test("^cortiq(\\.exe)?$")));
+            def checksum:
+              type == "object" and exact_keys(["name", "url", "releaseAssetId", "sizeBytes", "sha256"]) and
+              (.name | type == "string" and endswith(".sha256")) and
+              (.url == ("https://github.com/infosave2007/cmf/releases/download/" + $tag + "/" + .name)) and
+              (.releaseAssetId | posint) and (.sizeBytes | posint and . <= 4096) and (.sha256 | sha256);
+            type == "object" and exact_keys(["schemaVersion", "engine", "e2eFixture", "upstream", "artifacts", "unsupportedPlatforms", "validation"]) and
+            .schemaVersion == 1 and
+            (.engine | type == "object" and exact_keys(["name", "modelFormat", "integrationStatus"]) and . == {name: "cortiq", modelFormat: "cmf", integrationStatus: "bootstrap"}) and
+            (.e2eFixture | type == "object" and exact_keys(["path", "provenance", "runtimeTag", "sourceCommit", "license", "sizeBytes", "sha256"]) and
+              (.path | type == "string" and test("^testdata/cmf/[A-Za-z0-9._-]+\\.cmf$")) and
+              (.provenance | type == "string" and test("^testdata/cmf/[A-Za-z0-9._-]+\\.provenance\\.json$")) and
+              (.runtimeTag | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+              (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$")) and
+              .license == "Apache-2.0" and (.sizeBytes | posint) and (.sha256 | sha256)) and
+            (.upstream | type == "object" and exact_keys(["repository", "license", "release", "source"]) and
+              .repository == "infosave2007/cmf" and .license == "Apache-2.0" and
+              (.release | type == "object" and exact_keys(["tag", "id", "url", "publishedAt", "draft", "prerelease", "immutable"]) and
+                .tag == $tag and (.id | posint) and .url == ("https://github.com/infosave2007/cmf/releases/tag/" + $tag) and
+                (.publishedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+                .draft == false and .prerelease == false and (.immutable | type == "boolean")) and
+              (.source | type == "object" and exact_keys(["annotatedTagObject", "commit", "tagSignature"]) and
+                (.annotatedTagObject | type == "string" and test("^[0-9a-f]{40}$")) and .commit == $commit and
+                (.tagSignature | type == "object" and exact_keys(["verified", "reason"]) and (.verified | type == "boolean") and (.reason | type == "string" and length > 0)))) and
+            (.artifacts | type == "array" and length == 5 and
+              (map(.platform) | sort == ["darwin/amd64", "darwin/arm64", "linux/amd64", "windows/amd64", "windows/arm64"]) and
+              all(.[]; type == "object" and exact_keys(["platform", "upstreamTarget", "status", "archive", "checksum", "installedExecutable"]) and
+                (.platform as $platform | ["linux/amd64", "darwin/arm64", "darwin/amd64", "windows/amd64", "windows/arm64"] | index($platform) != null) and
+                (.upstreamTarget | type == "string" and test("^[A-Za-z0-9_-]+$")) and .status == "initial-packaging-scope" and
+                (.archive | archive) and (.checksum | checksum) and (.checksum.name == (.archive.name + ".sha256")) and
+                (.installedExecutable | type == "string" and test("^cortiq(\\.exe)?$")) and
+                ((.archive.format == "zip") == (.installedExecutable == "cortiq.exe")) and
+                (.archive.entries == [.installedExecutable]))) and
+            (.unsupportedPlatforms | type == "array" and length == 1 and (.[0] | type == "object" and exact_keys(["platform", "reason", "policy"]) and
+              .platform == "linux/arm64" and (.reason | type == "string" and length > 0) and (.policy | type == "string" and length > 0))) and
+            (.validation | type == "object" and exact_keys(["validatedAt", "checks", "provenance"]) and
+              (.validatedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+              (.checks | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
+              (.provenance | type == "string" and length > 0))
+          ' .cmf-candidate/cmf.lock.json >/dev/null || fail 'verified lock artifact violates the candidate whitelist'
+
+          candidate_head="$(printf '%s:%s' "$GITHUB_REPOSITORY_OWNER" "$CMF_CANDIDATE_BRANCH" | jq -sRr @uri)"
+          open_candidates="${RUNNER_TEMP}/cmf-open-candidates-${GITHUB_RUN_ID}.json"
+          curl --fail --silent --show-error --location \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 90 \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls?state=open&head=${candidate_head}&per_page=1" > "$open_candidates"
+          [[ "$(jq -er 'length' "$open_candidates")" == '0' ]] || {
+            echo "::notice::An open CMF candidate already exists; preserving ${CMF_CANDIDATE_BRANCH}."
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          candidate_ref="${RUNNER_TEMP}/cmf-candidate-ref-${GITHUB_RUN_ID}.json"
+          status="$(api_get_status "$candidate_ref" "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/heads/${CMF_CANDIDATE_BRANCH}")"
+          case "$status" in
+            404) echo 'ready=true' >> "$GITHUB_OUTPUT" ;;
+            200)
+              echo "::notice::CMF candidate branch ${CMF_CANDIDATE_BRANCH} exists without an open PR; preserving it."
+              echo 'ready=false' >> "$GITHUB_OUTPUT"
+              ;;
+            *) fail "unexpected status ${status} while checking ${CMF_CANDIDATE_BRANCH}" ;;
+          esac
+
+      - name: Commit and conditionally create the candidate branch
+        id: publish_candidate
+        if: steps.candidate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$*" >&2
+            exit 1
+          }
+
+          install -m 0644 .cmf-candidate/cmf.lock.json cmf.lock.json
+          git switch --create "$CMF_CANDIDATE_BRANCH"
+          git add -- cmf.lock.json
+          git diff --cached --quiet && fail 'verified candidate did not change cmf.lock.json'
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "build: intake CMF runtime ${CMF_CANDIDATE_TAG}"
+
+          # A zero-OID lease is an atomic create-only ref operation: if another
+          # actor creates this ref after the advisory check above, this fails
+          # instead of fast-forwarding, resetting, or overwriting that branch.
+          zero_oid='0000000000000000000000000000000000000000'
+          if git push --force-with-lease="refs/heads/${CMF_CANDIDATE_BRANCH}:${zero_oid}" \
+            origin "HEAD:refs/heads/${CMF_CANDIDATE_BRANCH}"; then
+            echo 'pushed=true' >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code origin "refs/heads/${CMF_CANDIDATE_BRANCH}" >/dev/null; then
+            echo "::notice::CMF candidate branch ${CMF_CANDIDATE_BRANCH} appeared concurrently; preserving it."
+            echo 'pushed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          fail 'conditional push failed before the candidate branch could be observed; retry rather than risk an overwrite'
+
+      - name: Open an immutable CMF intake candidate PR
+        id: create_pr
+        if: steps.publish_candidate.outputs.pushed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CMF_CANDIDATE_SHA: ${{ steps.publish_candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          body="$(cat <<EOF_BODY
+          Automated CMF candidate-input update.
+
+          A read-only job independently resolved the latest stable \`infosave2007/cmf\` release, required the complete reviewed desktop matrix, and verified every archive and adjacent checksum before this isolated job schema-checked and committed the sole canonical \`cmf.lock.json\` through a create-only branch lease.
+
+          - tag: \`${CMF_CANDIDATE_TAG}\`
+          - source commit: \`${CMF_CANDIDATE_SOURCE_COMMIT}\`
+          - candidate commit: \`${CMF_CANDIDATE_SHA}\`
+
+          This PR is an intake candidate only. It intentionally requires a reviewed fixture/provenance update before merge. It never publishes an \`ollamacmf\` release, installer, image, or \`latest\` tag.
+          EOF_BODY
+          )"
+          payload="$(jq -nc \
+            --arg title "build: intake CMF runtime ${CMF_CANDIDATE_TAG}" \
+            --arg head "$CMF_CANDIDATE_BRANCH" \
+            --arg base "$CMF_DEFAULT_BRANCH" \
+            --arg body "$body" \
+            '{title: $title, head: $head, base: $base, body: $body, maintainer_can_modify: false}')"
+          response="${RUNNER_TEMP}/cmf-create-pr-${GITHUB_RUN_ID}.json"
+          curl --fail --silent --show-error --location \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 90 \
+            --request POST \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --data "$payload" \
+            --output "$response" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls"
+          pr_url="$(jq -er '.html_url' "$response")"
+          echo "url=${pr_url}" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch trusted candidate validation
+        if: steps.create_pr.outputs.url != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CMF_CANDIDATE_SHA: ${{ steps.publish_candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          workflow="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/cmf-runner-smoke.yml"
+          metadata="${RUNNER_TEMP}/cmf-smoke-workflow-${GITHUB_RUN_ID}.json"
+          status="$(curl --silent --show-error --location \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 90 \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --output "$metadata" --write-out '%{http_code}' "$workflow")"
+          if [[ "$status" == '404' ]]; then
+            # GitHub exposes workflow_dispatch only after this workflow has
+            # landed on the default branch. The candidate PR remains intact;
+            # the first bootstrap review must run its PR workflow manually.
+            echo '::notice::CMF smoke workflow is not yet installed on the default branch; bootstrap candidate validation must be started manually.'
+            exit 0
+          fi
+          [[ "$status" == '200' ]] || {
+            echo "::error::unexpected status ${status} while discovering the CMF smoke workflow" >&2
+            exit 1
+          }
+
+          # Execute trusted default-branch workflow code while checking out the
+          # immutable candidate commit supplied below. This avoids dispatching
+          # a PR-controlled workflow definition and makes retries converge.
+          payload="$(jq -nc --arg ref "$CMF_DEFAULT_BRANCH" --arg candidate_sha "$CMF_CANDIDATE_SHA" '{ref: $ref, inputs: {candidate_sha: $candidate_sha}}')"
+          curl --fail --silent --show-error --location \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 90 \
+            --request POST \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --data "$payload" \
+            "${workflow}/dispatches"

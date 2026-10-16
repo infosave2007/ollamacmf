@@ -24,6 +24,11 @@ import (
 var (
 	errStalled = errors.New("download stalled")
 	errSlow    = errors.New("download too slow")
+
+	// ErrDigestMismatch identifies a completed transfer whose content digest
+	// differs from the registry descriptor. Callers use errors.Is to preserve
+	// their existing cleanup/error policy through retry wrapping.
+	ErrDigestMismatch = errors.New("digest mismatch")
 )
 
 type downloader struct {
@@ -340,7 +345,7 @@ func (d *downloader) save(ctx context.Context, cancel context.CancelCauseFunc, b
 
 	if got := fmt.Sprintf("sha256:%x", h.Sum(nil)); got != blob.Digest {
 		os.Remove(tmp)
-		return existingSize + n, fmt.Errorf("digest mismatch")
+		return existingSize + n, fmt.Errorf("%w: expected %s", ErrDigestMismatch, blob.Digest)
 	}
 	totalWritten := existingSize + n
 	if totalWritten != blob.Size {

@@ -52,6 +52,8 @@ var (
 	errCapabilityThinking   = errors.New("thinking")
 	errCapabilityImage      = errors.New("image generation")
 	errInsecureProtocol     = errors.New("insecure protocol http")
+	errCMFRemotePull        = errors.New("CMF models can only be imported from a local file")
+	errCMFRegistryPush      = errors.New("CMF models cannot be pushed to a registry")
 )
 
 type registryOptions struct {
@@ -100,6 +102,11 @@ type Model struct {
 
 func (m *Model) IsMLX() bool {
 	return m.Config.ModelFormat == "safetensors"
+}
+
+// IsCMF reports whether the model uses the opaque CMF container format.
+func (m *Model) IsCMF() bool {
+	return strings.EqualFold(m.Config.ModelFormat, manifest.FormatCMF)
 }
 
 func (m *Model) isGGUF() bool {
@@ -183,6 +190,14 @@ func (m *Model) publicCapabilities() []model.Capability {
 }
 
 func (m *Model) capabilitiesForTemplate(source templateCapabilitySource) []model.Capability {
+	// CMF metadata is intentionally opaque to Ollama. The Cortiq health API
+	// reports tools per model/template only after the sidecar starts, while
+	// Ollama must validate capabilities before scheduling it. Do not infer
+	// optional protocol capabilities from caller-provided metadata.
+	if m.IsCMF() {
+		return []model.Capability{model.CapabilityCompletion}
+	}
+
 	capabilities := []model.Capability{}
 	var modelArch string
 
@@ -637,7 +652,7 @@ func (m *Model) String() string {
 		})
 	}
 
-	if m.Template != nil {
+	if m.Template != nil && !m.IsCMF() {
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "template",
 			Args: m.Template.String(),
@@ -651,14 +666,14 @@ func (m *Model) String() string {
 		})
 	}
 
-	if m.Config.Renderer != "" {
+	if m.Config.Renderer != "" && !m.IsCMF() {
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "renderer",
 			Args: m.Config.Renderer,
 		})
 	}
 
-	if m.Config.Parser != "" {
+	if m.Config.Parser != "" && !m.IsCMF() {
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "parser",
 			Args: m.Config.Parser,
@@ -808,6 +823,9 @@ func modelFromManifest(n model.Name, mf *manifest.Manifest) (*Model, error) {
 			m.AdapterPaths = append(m.AdapterPaths, filename)
 		case "application/vnd.ollama.image.projector":
 			m.ProjectorPaths = append(m.ProjectorPaths, filename)
+			if m.IsCMF() {
+				break
+			}
 			if md, err := readGGUFMetadata(layer.Digest); err != nil {
 				slog.Error("couldn't read projector metadata", "error", err)
 			} else {
@@ -1013,20 +1031,50 @@ func PruneLayers() error {
 
 func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
 	n := model.ParseName(name)
-	fn(api.ProgressResponse{Status: "retrieving manifest"})
-
-	if n.ProtocolScheme == "http" && !regOpts.Insecure {
-		return errInsecureProtocol
+	insecureProtocol := n.ProtocolScheme == "http" && !regOpts.Insecure
+	// CMF needs to fail before the first progress event so its local-only
+	// policy can reach the HTTP handler as a 4xx. Keep the historical initial
+	// progress event for every other preflight failure: a streaming caller has
+	// traditionally observed that event before a malformed local manifest,
+	// missing config blob, or insecure registry error.
+	progressSent := false
+	emitRetrievingManifest := func() {
+		if progressSent {
+			return
+		}
+		fn(api.ProgressResponse{Status: "retrieving manifest"})
+		progressSent = true
+	}
+	returnPreflightError := func(err error) error {
+		if errors.Is(err, errCMFRegistryPush) {
+			return err
+		}
+		emitRetrievingManifest()
+		// Before CMF support the insecure-destination check ran before every
+		// local manifest operation. Once a non-CMF preflight has established
+		// that it is safe to emit progress, retain that error precedence too.
+		if insecureProtocol {
+			return errInsecureProtocol
+		}
+		return err
 	}
 
 	manifestJSON, err := manifest.ReadManifestData(n)
 	if err != nil {
+		if insecureProtocol {
+			return returnPreflightError(err)
+		}
+		emitRetrievingManifest()
 		fn(api.ProgressResponse{Status: "couldn't retrieve manifest"})
 		return err
 	}
 
 	var stored manifest.Manifest
 	if err := json.Unmarshal(manifestJSON, &stored); err != nil {
+		if insecureProtocol {
+			return returnPreflightError(err)
+		}
+		emitRetrievingManifest()
 		fn(api.ProgressResponse{Status: "couldn't retrieve manifest"})
 		return err
 	}
@@ -1037,14 +1085,21 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 	if stored.MediaType == manifest.MediaTypeManifestList {
 		layers, err = pushLayersForManifestList(stored)
 		if err != nil {
-			return err
+			return returnPreflightError(err)
 		}
 		manifestMediaType = manifest.MediaTypeManifestList
 	} else {
 		mf, err := manifest.ParseNamedManifest(n)
 		if err != nil {
+			if insecureProtocol {
+				return returnPreflightError(err)
+			}
+			emitRetrievingManifest()
 			fn(api.ProgressResponse{Status: "couldn't retrieve manifest"})
 			return err
+		}
+		if err := rejectCMFRegistryPush(mf); err != nil {
+			return returnPreflightError(err)
 		}
 
 		layers = append(layers, mf.Layers...)
@@ -1055,10 +1110,23 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		if !hasTensorLayers(layers) {
 			manifestJSON, err = json.Marshal(mf)
 			if err != nil {
-				return err
+				return returnPreflightError(err)
 			}
 		}
 	}
+
+	// This follows CMF inspection deliberately. A valid local CMF model is
+	// always classified by the local-only policy (with no progress event), even
+	// when its destination would also be rejected as insecure. Ordinary models
+	// retain the old progress-before-insecure-error behavior.
+	if insecureProtocol {
+		return returnPreflightError(errInsecureProtocol)
+	}
+
+	// A local-only CMF policy rejection must happen before the first progress
+	// event. That lets both streaming and non-streaming HTTP handlers report it
+	// as a client error rather than committing an initial 200 response.
+	emitRetrievingManifest()
 
 	// Use fast transfer for models with tensor layers (many small blobs)
 	if hasTensorLayers(layers) {
@@ -1094,6 +1162,15 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 }
 
 func pushLayersForManifestList(parent manifest.Manifest) ([]manifest.Layer, error) {
+	// Named manifest lists are normally marshaled without a root runner/format
+	// or config, but a local store can contain raw OCI JSON from an older client
+	// or a registry. Gate those root fields too: ignoring them would make the
+	// local-only CMF policy depend on a serializer detail rather than all of the
+	// manifest data that is about to be uploaded.
+	if err := rejectCMFRegistryPush(&parent); err != nil {
+		return nil, err
+	}
+
 	seen := make(map[string]struct{})
 	var layers []manifest.Layer
 
@@ -1121,6 +1198,9 @@ func pushLayersForManifestList(parent manifest.Manifest) ([]manifest.Layer, erro
 	}
 
 	for _, child := range parent.Manifests {
+		if manifestUsesCMF(&child) {
+			return nil, errCMFRegistryPush
+		}
 		childDigest := child.BlobDigest()
 		if childDigest == "" {
 			return nil, errors.New("manifest list child is missing digest")
@@ -1134,6 +1214,9 @@ func pushLayersForManifestList(parent manifest.Manifest) ([]manifest.Layer, erro
 				// bare references until pulled explicitly.
 				return nil, fmt.Errorf("manifest child for runner %q is not local; pull it with --runner %s before pushing", child.Runner, child.Runner)
 			}
+			return nil, err
+		}
+		if err := rejectCMFRegistryPush(resolved); err != nil {
 			return nil, err
 		}
 
@@ -1159,6 +1242,24 @@ func pushLayersForManifestList(parent manifest.Manifest) ([]manifest.Layer, erro
 
 func PullModel(ctx context.Context, name string, runner string, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
 	n := model.ParseName(name)
+	// See PushModel's matching preflight wrapper. CMF policy errors must remain
+	// first responses so they can become HTTP 400, while ordinary preflight
+	// failures retain the progress-first streaming contract used by existing
+	// clients.
+	progressSent := false
+	emitPullingManifest := func() {
+		if progressSent {
+			return
+		}
+		fn(api.ProgressResponse{Status: "pulling manifest"})
+		progressSent = true
+	}
+	returnPreflightError := func(err error) error {
+		if !errors.Is(err, errCMFRemotePull) {
+			emitPullingManifest()
+		}
+		return err
+	}
 
 	// build deleteMap to prune unused layers
 	deleteMap := make(map[string]struct{})
@@ -1181,20 +1282,50 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 		return errInsecureProtocol
 	}
 
-	fn(api.ProgressResponse{Status: "pulling manifest"})
-
 	mf, manifestData, err := pullModelManifest(ctx, n, regOpts)
 	if err != nil {
-		return fmt.Errorf("pull model manifest: %s", err)
+		return returnPreflightError(fmt.Errorf("pull model manifest: %s", err))
+	}
+	// Do not treat root metadata on a manifest list as harmless just because the
+	// ordinary serializer omits it. A remote registry can serve raw list JSON;
+	// every declared CMF runner/format stays local-only before a child or any
+	// payload is fetched.
+	if manifestUsesCMF(mf) {
+		return errCMFRemotePull
 	}
 	selectedChildDigest := ""
 	if mf.MediaType == manifest.MediaTypeManifestList {
+		// A nonstandard list root can also carry a config. Preflight it before
+		// selecting/downloading a child so CMF cannot hide in metadata that list
+		// semantics normally ignore.
+		if err := preflightRemoteCMFConfig(ctx, n, mf, regOpts); err != nil {
+			return returnPreflightError(err)
+		}
+		// CMF imports intentionally go through the local CREATE path, which
+		// validates the CMF envelope and rejects unsupported model overlays.
+		// A manifest-list reference carries runner/format metadata, so reject
+		// any declared CMF variant before caching a parent that could later make
+		// it selectable. This happens before downloading a child manifest or any
+		// model blob.
+		for i := range mf.Manifests {
+			if manifestUsesCMF(&mf.Manifests[i]) {
+				return errCMFRemotePull
+			}
+		}
+		if _, err := manifest.SelectManifestReferenceForRunner(mf.Manifests, runner); err != nil {
+			return returnPreflightError(err)
+		}
 		var childDigest string
 		mf, childDigest, err = pullSelectedManifest(ctx, n, mf, runner, regOpts, fn)
 		if err != nil {
-			return err
+			return returnPreflightError(err)
 		}
 		selectedChildDigest = childDigest
+		// Keep the boundary closed even if a registry omitted CMF metadata from
+		// its parent reference but declared it inside the selected child.
+		if manifestUsesCMF(mf) {
+			return errCMFRemotePull
+		}
 	} else if runner != "" {
 		// The registry served a plain manifest, so there is no variant to
 		// select. Honor an explicit runner request by rejecting a declared
@@ -1202,21 +1333,41 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 		// without runner metadata cannot be checked before their config blob
 		// is local, so they proceed as before.
 		if mf.Runner != "" && !strings.EqualFold(mf.Runner, runner) {
-			return fmt.Errorf("%w for runners: %s", manifest.ErrNoCompatibleManifest, runner)
+			return returnPreflightError(fmt.Errorf("%w for runners: %s", manifest.ErrNoCompatibleManifest, runner))
 		}
 	}
+	if manifestUsesCMF(mf) {
+		return errCMFRemotePull
+	}
+
+	// Runner/format metadata is optional on legacy manifests. Fetch and verify
+	// the config before scheduling any model layer so an unmarked CMF payload
+	// cannot cause model bytes to be persisted merely because a best-effort
+	// compatibility preflight happened to fail. This intentionally fails closed
+	// for an unreadable config: a remote CMF model is unsupported, and allowing
+	// the rest of the pull to continue would reopen that boundary.
+	if err := preflightRemoteCMFConfig(ctx, n, mf, regOpts); err != nil {
+		return returnPreflightError(err)
+	}
+
+	// The CMF gates above intentionally precede the first progress event. A
+	// streamed request writes headers on its first event, so emitting "pulling
+	// manifest" earlier would make a deterministic local-only policy error look
+	// like a successful HTTP response.
+	emitPullingManifest()
 
 	// Checked against the selected child: a manifest list carries no layers of
-	// its own, so testing the parent would skip the gate entirely.
+	// its own, so testing the parent would skip the gate entirely. Keep this
+	// after the CMF preflight so a registry cannot disguise CMF as an unavailable
+	// alternate runner and escape the local-only classification.
 	if requiresMLX(mf) {
 		if err := mlx.CheckInit(); err != nil {
 			slog.Debug("MLX is unavailable for safetensors model pull", "error", err)
-			return errors.New("this model requires MLX support, but the MLX runtime is not available")
+			return returnPreflightError(errors.New("this model requires MLX support, but the MLX runtime is not available"))
 		}
 	}
-
 	if err := checkModelRequires(ctx, n, mf, regOpts); err != nil {
-		return err
+		return returnPreflightError(err)
 	}
 
 	var layers []manifest.Layer
@@ -1227,7 +1378,9 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 
 	// Use fast transfer for models with tensor layers (many small blobs)
 	if hasTensorLayers(layers) {
-		if err := pullWithTransfer(ctx, n, layers, manifestData, regOpts, fn); err != nil {
+		if err := pullWithTransfer(ctx, n, layers, manifestData, regOpts, fn, func() error {
+			return rejectRemoteCMFConfig(mf)
+		}); err != nil {
 			return err
 		}
 		writePullDowngradeAnchor(n, mf, manifestData, selectedChildDigest)
@@ -1283,6 +1436,9 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 		delete(deleteMap, layer.Digest)
 	}
 	delete(deleteMap, mf.Config.Digest)
+	if err := rejectRemoteCMFConfig(mf); err != nil {
+		return err
+	}
 
 	fn(api.ProgressResponse{Status: "writing manifest"})
 
@@ -1305,6 +1461,135 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 	fn(api.ProgressResponse{Status: "success"})
 
 	return nil
+}
+
+// manifestUsesCMF identifies the canonical metadata emitted by this fork as
+// well as accepted local runner aliases. Remote CMF delivery is deliberately
+// disabled until the pull path can perform the same envelope and overlay
+// validation as local CREATE without first persisting untrusted model blobs.
+func manifestUsesCMF(mf *manifest.Manifest) bool {
+	if mf == nil {
+		return false
+	}
+	if strings.EqualFold(mf.Format, manifest.FormatCMF) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(mf.Runner)) {
+	case manifest.RunnerCMF, "cmfrunner", "cmf-runner", "cmf_runner", "cortiq":
+		return true
+	default:
+		return false
+	}
+}
+
+func configUsesCMF(config *model.ConfigV2) bool {
+	if config == nil {
+		return false
+	}
+	if strings.EqualFold(config.ModelFormat, manifest.FormatCMF) {
+		return true
+	}
+	return config.Draft != nil && strings.EqualFold(config.Draft.ModelFormat, manifest.FormatCMF)
+}
+
+// rejectRemoteCMFConfig is the final remote-pull gate for a CMF model revealed
+// only by its config blob. The caller must invoke it before making the model's
+// named manifest visible. A config error is returned unchanged so the normal
+// transfer/verification error remains actionable.
+func rejectRemoteCMFConfig(mf *manifest.Manifest) error {
+	config, err := readVerifiedPullConfig(mf)
+	if err != nil {
+		return err
+	}
+	if configUsesCMF(config) {
+		return errCMFRemotePull
+	}
+	return nil
+}
+
+// preflightRemoteCMFConfig closes the legacy-manifest gap before any model
+// layer is eligible for transfer. Config blobs are small metadata inputs, but
+// they are still downloaded through the ordinary registry path and verified by
+// digest before parsing. Unlike checkModelRequires, this gate must not treat a
+// failed config request as optional: doing so would allow a registry to hide a
+// CMF model behind ordinary manifest metadata and transfer its payload first.
+func preflightRemoteCMFConfig(ctx context.Context, n model.Name, mf *manifest.Manifest, regOpts *registryOptions) error {
+	if mf == nil || mf.Config.Digest == "" {
+		return nil
+	}
+
+	if err := verifyBlob(mf.Config.Digest); err != nil {
+		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errDigestMismatch) {
+			return err
+		}
+		if err := downloadWithTransfer(ctx, n, []manifest.Layer{mf.Config}, regOpts, func(api.ProgressResponse) {}); err != nil {
+			if errors.Is(err, transfer.ErrDigestMismatch) {
+				return fmt.Errorf("%w: %v", errDigestMismatch, err)
+			}
+			return fmt.Errorf("download model config before CMF gate: %w", err)
+		}
+		if err := verifyBlob(mf.Config.Digest); err != nil {
+			return err
+		}
+	}
+
+	return rejectRemoteCMFConfig(mf)
+}
+
+// rejectCMFRegistryPush keeps the experimental CMF integration local-only.
+// A local CMF import has envelope and overlay validation that a registry does
+// not carry; pushing it would create an unsupported artifact that this fork
+// intentionally refuses to pull. Check both canonical manifest metadata and
+// legacy config metadata before the first upload request.
+func rejectCMFRegistryPush(mf *manifest.Manifest) error {
+	if manifestUsesCMF(mf) {
+		return errCMFRegistryPush
+	}
+
+	config, err := readVerifiedPullConfig(mf)
+	if err != nil {
+		// Existing local manifests can contain arbitrary config layers which are
+		// not parsed by PushModel. A malformed JSON value cannot declare a CMF
+		// model, so preserve that established push behavior while still treating
+		// missing/unverified config bytes as ordinary push errors.
+		var syntaxErr *json.SyntaxError
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+			return nil
+		}
+		return err
+	}
+	if configUsesCMF(config) {
+		return errCMFRegistryPush
+	}
+	return nil
+}
+
+// readVerifiedPullConfig returns a locally present, digest-verified manifest
+// config. It deliberately does not fetch a missing config: PullModel's
+// established transfer path owns retries, error reporting, and cleanup.
+func readVerifiedPullConfig(mf *manifest.Manifest) (*model.ConfigV2, error) {
+	if mf == nil || mf.Config.Digest == "" {
+		return nil, nil
+	}
+
+	if err := verifyBlob(mf.Config.Digest); err != nil {
+		return nil, err
+	}
+
+	path, err := manifest.BlobsPath(mf.Config.Digest)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var config model.ConfigV2
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+	return &config, nil
 }
 
 // requiresMLX reports whether serving mf needs the MLX runtime. A declared
@@ -1542,9 +1827,17 @@ func writePullDowngradeAnchor(n model.Name, mf *manifest.Manifest, manifestData 
 }
 
 // pullWithTransfer uses the simplified x/transfer package for downloading blobs.
-func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer, manifestData []byte, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
+// beforeWrite runs after every blob has transferred but before the named
+// manifest is published, allowing the caller to enforce model-type gates that
+// depend on a verified config blob.
+func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer, manifestData []byte, regOpts *registryOptions, fn func(api.ProgressResponse), beforeWrite func() error) error {
 	if err := downloadWithTransfer(ctx, n, layers, regOpts, fn); err != nil {
 		return err
+	}
+	if beforeWrite != nil {
+		if err := beforeWrite(); err != nil {
+			return err
+		}
 	}
 
 	// Write manifest
