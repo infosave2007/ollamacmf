@@ -1,0 +1,177 @@
+{
+  "schemaVersion": 1,
+  "engine": {
+    "name": "cortiq",
+    "modelFormat": "cmf",
+    "integrationStatus": "bootstrap"
+  },
+  "e2eFixture": {
+    "path": "testdata/cmf/tiny-v0.8.19.cmf",
+    "provenance": "testdata/cmf/tiny-v0.8.19.provenance.json",
+    "runtimeTag": "v0.8.19",
+    "sourceCommit": "5d6f1830cfec6ed1cdd1eca9e9c259a66c998716",
+    "license": "Apache-2.0",
+    "sizeBytes": 51361,
+    "sha256": "21c760da27e9d8f769c9e60af8551273be25f556ac1f827c7382667043488f0c"
+  },
+  "upstream": {
+    "repository": "infosave2007/cmf",
+    "license": "Apache-2.0",
+    "release": {
+      "tag": "v0.8.19",
+      "id": 414030103,
+      "url": "https://github.com/infosave2007/cmf/releases/tag/v0.8.19",
+      "publishedAt": "2026-10-15T16:28:20Z",
+      "draft": false,
+      "prerelease": false,
+      "immutable": false
+    },
+    "source": {
+      "annotatedTagObject": "4589a24bb220c5ae8839f2eb1d814ac6a0ffe0e5",
+      "commit": "5d6f1830cfec6ed1cdd1eca9e9c259a66c998716",
+      "tagSignature": {
+        "verified": false,
+        "reason": "unsigned"
+      }
+    }
+  },
+  "artifacts": [
+    {
+      "platform": "linux/amd64",
+      "upstreamTarget": "x86_64-unknown-linux-gnu",
+      "status": "initial-packaging-scope",
+      "archive": {
+        "name": "cortiq-x86_64-unknown-linux-gnu.tar.gz",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-x86_64-unknown-linux-gnu.tar.gz",
+        "releaseAssetId": 644466630,
+        "sizeBytes": 17549846,
+        "sha256": "3eaf9347ce9cca8266d381bec8608246f3ccad6f891a63f8f72839c41e1a0e6e",
+        "format": "tar.gz",
+        "entries": [
+          "cortiq"
+        ]
+      },
+      "checksum": {
+        "name": "cortiq-x86_64-unknown-linux-gnu.tar.gz.sha256",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-x86_64-unknown-linux-gnu.tar.gz.sha256",
+        "releaseAssetId": 644466621,
+        "sizeBytes": 105,
+        "sha256": "c69a88d1e4a8bd0694d23087931dbb0949596d7d055f562f26662a3153870a7b"
+      },
+      "installedExecutable": "cortiq"
+    },
+    {
+      "platform": "darwin/arm64",
+      "upstreamTarget": "aarch64-apple-darwin",
+      "status": "initial-packaging-scope",
+      "archive": {
+        "name": "cortiq-aarch64-apple-darwin.tar.gz",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-aarch64-apple-darwin.tar.gz",
+        "releaseAssetId": 644475295,
+        "sizeBytes": 16063959,
+        "sha256": "7e54b8409561a2dcde85fd12123f9c3b0420a83658518c35f1202e139442f1cd",
+        "format": "tar.gz",
+        "entries": [
+          "cortiq"
+        ]
+      },
+      "checksum": {
+        "name": "cortiq-aarch64-apple-darwin.tar.gz.sha256",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-aarch64-apple-darwin.tar.gz.sha256",
+        "releaseAssetId": 644475288,
+        "sizeBytes": 101,
+        "sha256": "b85231b8a1f83ead5ba0f721623aae59028b62ef0d52f1f607bcc662a524b6df"
+      },
+      "installedExecutable": "cortiq"
+    },
+    {
+      "platform": "darwin/amd64",
+      "upstreamTarget": "x86_64-apple-darwin",
+      "status": "initial-packaging-scope",
+      "archive": {
+        "name": "cortiq-x86_64-apple-darwin.tar.gz",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-x86_64-apple-darwin.tar.gz",
+        "releaseAssetId": 644476477,
+        "sizeBytes": 17055901,
+        "sha256": "3c65b414b56b5837ef53c66fc2150237623afba05ef0ebce5e31d0a7adcfcf68",
+        "format": "tar.gz",
+        "entries": [
+          "cortiq"
+        ]
+      },
+      "checksum": {
+        "name": "cortiq-x86_64-apple-darwin.tar.gz.sha256",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-x86_64-apple-darwin.tar.gz.sha256",
+        "releaseAssetId": 644476475,
+        "sizeBytes": 100,
+        "sha256": "857da28e3d7485369bb1281af3fa7fcfd5437c960be86b067c75ffaaf22a0466"
+      },
+      "installedExecutable": "cortiq"
+    },
+    {
+      "platform": "windows/amd64",
+      "upstreamTarget": "x86_64-pc-windows-msvc",
+      "status": "initial-packaging-scope",
+      "archive": {
+        "name": "cortiq-x86_64-pc-windows-msvc.zip",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-x86_64-pc-windows-msvc.zip",
+        "releaseAssetId": 644491435,
+        "sizeBytes": 18248114,
+        "sha256": "a5224aff66562170787650163b9a466f9c1e8422b1b52c646a5bebf9d7a8c001",
+        "format": "zip",
+        "entries": [
+          "cortiq.exe"
+        ]
+      },
+      "checksum": {
+        "name": "cortiq-x86_64-pc-windows-msvc.zip.sha256",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-x86_64-pc-windows-msvc.zip.sha256",
+        "releaseAssetId": 644491432,
+        "sizeBytes": 100,
+        "sha256": "2449074c9ffdb725e96d838b5a7e3f617763f8dc1c2956f47ba5f5b7cfe49a2f"
+      },
+      "installedExecutable": "cortiq.exe"
+    },
+    {
+      "platform": "windows/arm64",
+      "upstreamTarget": "aarch64-pc-windows-msvc",
+      "status": "initial-packaging-scope",
+      "archive": {
+        "name": "cortiq-aarch64-pc-windows-msvc.zip",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-aarch64-pc-windows-msvc.zip",
+        "releaseAssetId": 644483578,
+        "sizeBytes": 16800336,
+        "sha256": "fb0319c2372db6bf3a087766b5005b2212ab622606d7fcaf799ee387dc4ee24b",
+        "format": "zip",
+        "entries": [
+          "cortiq.exe"
+        ]
+      },
+      "checksum": {
+        "name": "cortiq-aarch64-pc-windows-msvc.zip.sha256",
+        "url": "https://github.com/infosave2007/cmf/releases/download/v0.8.19/cortiq-aarch64-pc-windows-msvc.zip.sha256",
+        "releaseAssetId": 644483570,
+        "sizeBytes": 101,
+        "sha256": "c8909370b3c5d10375ac39f75ae87d53e69cad13e9b94fb3be3ad4ed997bf8a9"
+      },
+      "installedExecutable": "cortiq.exe"
+    }
+  ],
+  "unsupportedPlatforms": [
+    {
+      "platform": "linux/arm64",
+      "reason": "CMF v0.8.19 does not publish cortiq-aarch64-unknown-linux-gnu.tar.gz.",
+      "policy": "Do not substitute an unpinned source build or another target artifact. Add this platform only through a new reviewed lock revision."
+    }
+  ],
+  "validation": {
+    "validatedAt": "2026-10-16T06:27:05Z",
+    "checks": [
+      "Fetched release metadata from the GitHub Releases API.",
+      "Downloaded each listed desktop archive and its adjacent .sha256 asset from the pinned release.",
+      "Verified every downloaded archive with its published SHA-256 checksum.",
+      "Listed archive contents and confirmed the sole executable entry: cortiq on Unix and cortiq.exe on Windows."
+    ],
+    "provenance": "Transfer integrity is verified against release-provided checksums. The v0.8.19 tag is unsigned and the release is not immutable, so this lock is not a cryptographic provenance attestation."
+  }
+}

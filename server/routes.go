@@ -33,6 +33,7 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/auth"
+	"github.com/ollama/ollama/cmfrunner"
 	"github.com/ollama/ollama/decision"
 	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/envconfig"
@@ -142,6 +143,14 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 		opts.NumCtx = s.defaultNumCtx
 	}
 
+	if model != nil && model.IsCMF() {
+		for _, optionMap := range []map[string]any{model.GenerationDefaults, model.Options, requestOpts} {
+			if err := validateCMFOptionMap(optionMap); err != nil {
+				return api.Options{}, err
+			}
+		}
+	}
+
 	// api.Options stores defaulted values, so lower layers cannot distinguish
 	// an unset draft_num_predict from the default. Track that while we still
 	// have the raw model/request option maps.
@@ -149,16 +158,16 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 	if model != nil {
 		draftNumPredictSet = draftNumPredictSet || hasOption(model.Options, "draft_num_predict")
 		if err := opts.FromMap(model.GenerationDefaults); err != nil {
-			return api.Options{}, err
+			return api.Options{}, cmfOptionParseError(model, err)
 		}
 		if err := opts.FromMap(model.Options); err != nil {
-			return api.Options{}, err
+			return api.Options{}, cmfOptionParseError(model, err)
 		}
 	}
 
 	warnDeprecatedOptions(requestOpts)
 	if err := opts.FromMap(requestOpts); err != nil {
-		return api.Options{}, err
+		return api.Options{}, cmfOptionParseError(model, err)
 	}
 
 	if applyEmbeddingBatchDefault {
@@ -170,6 +179,42 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 	}
 
 	return opts, nil
+}
+
+func cmfOptionParseError(model *Model, err error) error {
+	if model != nil && model.IsCMF() {
+		return api.StatusError{StatusCode: http.StatusBadRequest, ErrorMessage: err.Error()}
+	}
+	return err
+}
+
+// CMF's public Cortiq protocol currently exposes only these request controls.
+// In particular it cannot honor Ollama runner knobs such as num_gpu, num_ctx,
+// num_batch, num_thread, use_mmap, or draft_num_predict. Validate raw maps
+// before scheduling so a request cannot start an unusable sidecar and then
+// silently ignore the caller's requested resources.
+var cmfSupportedOptionKeys = map[string]struct{}{
+	"temperature": {},
+	"top_p":       {},
+	"seed":        {},
+	"num_predict": {},
+}
+
+func validateCMFOptionMap(options map[string]any) error {
+	var unsupported []string
+	for key := range options {
+		if _, ok := cmfSupportedOptionKeys[key]; !ok {
+			unsupported = append(unsupported, key)
+		}
+	}
+	if len(unsupported) == 0 {
+		return nil
+	}
+	slices.Sort(unsupported)
+	return api.StatusError{
+		StatusCode:   http.StatusBadRequest,
+		ErrorMessage: fmt.Sprintf("CMF does not support option(s): %s", strings.Join(unsupported, ", ")),
+	}
 }
 
 func shouldApplyEmbeddingBatchDefault(m *Model, requestOpts map[string]any) bool {
@@ -233,28 +278,24 @@ func normalizeRunner(runner string) (string, error) {
 		return manifest.RunnerGGML, nil
 	case manifest.RunnerLlamaCPP, "llama.cpp", "llama-cpp", "llama_cpp":
 		return manifest.RunnerLlamaCPP, nil
+	case manifest.RunnerCMF, "cmfrunner", "cmf-runner", "cmf_runner", "cortiq":
+		return manifest.RunnerCMF, nil
 	default:
 		return "", fmt.Errorf("unknown runner %q", runner)
 	}
 }
 
-// scheduleRunner schedules a runner after validating inputs such as capabilities and model options.
-// It returns the allocated runner, model instance, and consolidated options if successful and error otherwise.
-func (s *Server) scheduleRunner(ctx context.Context, name, selectedRunner string, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration, shift *bool) (llm.LlamaServer, *Model, *api.Options, error) {
-	if name == "" {
-		return nil, nil, nil, fmt.Errorf("model %w", errRequired)
-	}
-
-	model, err := s.getExistingModelForRunner(name, selectedRunner)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return s.scheduleRunnerForModel(ctx, model, caps, requestOpts, keepAlive, shift)
-}
-
 // scheduleRunnerForModel retains the request's resolved model, including its selected
 // manifest-list child, without repeating model lookup and metadata loading.
 func (s *Server) scheduleRunnerForModel(ctx context.Context, m *Model, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration, shift *bool) (llm.LlamaServer, *Model, *api.Options, error) {
+	return s.scheduleRunnerForModelWithOptionValidation(ctx, m, caps, requestOpts, keepAlive, shift, nil)
+}
+
+// scheduleRunnerForModelWithOptionValidation validates the merged options
+// after model and request defaults are resolved, but before a runner can be
+// scheduled. This is needed when support depends on the execution mode rather
+// than the model alone.
+func (s *Server) scheduleRunnerForModelWithOptionValidation(ctx context.Context, m *Model, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration, shift *bool, validateOptions func(api.Options) error) (llm.LlamaServer, *Model, *api.Options, error) {
 	// TODO: enable compatibility migration
 	// selectedName := model.ParseName(m.Name)
 	// if !manifest.IsDigestReferenceName(selectedName) {
@@ -282,13 +323,23 @@ func (s *Server) scheduleRunnerForModel(ctx context.Context, m *Model, caps []mo
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	if validateOptions != nil {
+		if err := validateOptions(opts); err != nil {
+			return nil, nil, nil, err
+		}
+	}
 
 	runnerCh, errCh := s.sched.getRunner(ctx, m, opts, keepAlive, numCtxAuto, numBatchAuto, shift)
 	var runner *runnerRef
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
 	select {
 	case runner = <-runnerCh:
 	case err = <-errCh:
 		return nil, nil, nil, err
+	case <-ctx.Done():
+		return nil, nil, nil, ctx.Err()
 	}
 
 	return runner.llama, m, &opts, nil
@@ -494,12 +545,28 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "image generation models are not currently supported"})
 		return
 	}
+	if m.IsCMF() {
+		if message := cmfGenerateRequestError(m, req); message != "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": message})
+			return
+		}
+		if req.Raw {
+			if err := validateCMFRawCompletionOptionMaps(m, req.Options); err != nil {
+				var statusErr api.StatusError
+				if errors.As(err, &statusErr) {
+					c.AbortWithStatusJSON(statusErr.StatusCode, gin.H{"error": statusErr.ErrorMessage})
+					return
+				}
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+		}
+	}
 
 	if req.Raw && (req.Template != "" || req.System != "" || len(req.Context) > 0) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "raw mode does not support template, system, or context"})
 		return
 	}
-
 	thinking := m.genericThinking()
 	if thinking == nil {
 		if err := api.ValidateLegacyThinking(req.Think); err != nil {
@@ -567,6 +634,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			Done:       true,
 			DoneReason: "load",
 		})
+		return
+	}
+	if m.IsCMF() && !req.Raw {
+		s.generateCMFNative(c, req, m, r, opts, checkpointStart, checkpointLoaded)
 		return
 	}
 
@@ -639,7 +710,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		// the real chat handler, but doing this as a stopgap to get renderer
 		// support for generate
 		if values.Messages != nil && values.Suffix == "" && req.Template == "" {
-			genTruncate := (req.Truncate == nil || *req.Truncate) && !m.IsMLX()
+			genTruncate := (req.Truncate == nil || *req.Truncate) && !m.IsMLX() && !m.IsCMF()
 			if m.HasChatTemplate && chatModeForModel(m) == chatExecutionModeNative {
 				nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
 					Messages:    values.Messages,
@@ -828,12 +899,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}); err != nil {
 			if parserErr == nil {
 				s.sched.expireRunnersForRuntimeOOM(m, err)
-				var serr api.StatusError
-				if errors.As(err, &serr) {
-					ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
-				} else {
-					ch <- gin.H{"error": err.Error()}
-				}
+				ch <- runnerErrorResponse(err)
 			}
 		}
 		if parserErr != nil {
@@ -841,6 +907,165 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 	}()
 
+	writeGenerateResponse(c, req, ch)
+}
+
+// generateCMFNative implements /api/generate through Cortiq's native chat
+// endpoint. CMF owns its tokenizer and template, so rendering a faux prompt
+// in Ollama would either be incorrect or require unsupported token APIs.
+func (s *Server) generateCMFNative(c *gin.Context, req api.GenerateRequest, m *Model, r llm.LlamaServer, opts *api.Options, checkpointStart, checkpointLoaded time.Time) {
+	// Keep the helper defensive for callers other than GenerateHandler. The
+	// normal handler rejects these before it schedules a sidecar.
+	if message := cmfGenerateRequestError(m, req); message != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": message})
+		return
+	}
+
+	var messages []api.Message
+	if req.System != "" {
+		messages = append(messages, api.Message{Role: "system", Content: req.System})
+	} else if m.System != "" {
+		messages = append(messages, api.Message{Role: "system", Content: m.System})
+	}
+	messages = append(messages, m.Messages...)
+	messages = append(messages, api.Message{Role: "user", Content: req.Prompt})
+
+	ch := make(chan any)
+	go func() {
+		defer close(ch)
+		err := r.Chat(c.Request.Context(), llm.ChatRequest{
+			Messages: messages,
+			Format:   req.Format,
+			Options:  opts,
+			Think:    req.Think,
+			// Cortiq owns its context policy. Explicit shift/truncate controls
+			// are rejected before scheduling, and the nil/default API values must
+			// not be misrepresented as an Ollama-side context operation.
+			Shift:       false,
+			Logprobs:    req.Logprobs,
+			TopLogprobs: req.TopLogprobs,
+		}, func(cr llm.ChatResponse) {
+			response := api.GenerateResponse{
+				Model:     req.Model,
+				CreatedAt: time.Now().UTC(),
+				Response:  cr.Message.Content,
+				Thinking:  cr.Message.Thinking,
+				ToolCalls: cr.Message.ToolCalls,
+				Done:      cr.Done,
+				Metrics: api.Metrics{
+					PromptEvalCount:       cr.PromptEvalCount,
+					PromptEvalCachedCount: cr.PromptEvalCachedCount,
+					PromptEvalDuration:    cr.PromptEvalDuration,
+					EvalCount:             cr.EvalCount,
+					EvalDuration:          cr.EvalDuration,
+				},
+			}
+			if cr.Done {
+				response.DoneReason = cr.DoneReason.String()
+				response.TotalDuration = time.Since(checkpointStart)
+				response.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+			}
+			ch <- response
+		})
+		if err != nil {
+			s.sched.expireRunnersForRuntimeOOM(m, err)
+			ch <- runnerErrorResponse(err)
+		}
+	}()
+
+	writeGenerateResponse(c, req, ch)
+}
+
+func cmfGenerateRequestError(m *Model, req api.GenerateRequest) string {
+	if message := cmfOutputRequestError(req.Format, req.Logprobs, req.TopLogprobs); message != "" {
+		return message
+	}
+	if message := cmfContextControlError(req.Truncate, req.Shift); message != "" {
+		return message
+	}
+	switch {
+	case m != nil && cmfMessagesContainImages(m.Messages):
+		// Create rejects this for new CMF models, but keep generation safe for
+		// legacy or externally-created manifests that contain an image message.
+		// This check must happen before a Cortiq sidecar is scheduled.
+		return "CMF models do not support model messages containing images"
+	case len(req.Images) > 0:
+		return "CMF models do not support generate images"
+	case req.Context != nil:
+		return "CMF models do not support generate context; use /api/chat to send message history"
+	case req.Suffix != "":
+		return "CMF models do not support generate suffix"
+	case req.Template != "":
+		return "CMF models render their chat template inside Cortiq; generate template is unsupported"
+	case req.DebugRenderOnly:
+		return "CMF models do not expose rendered prompts"
+	default:
+		return ""
+	}
+}
+
+func cmfOutputRequestError(format json.RawMessage, logprobs bool, topLogprobs int) string {
+	format = bytes.TrimSpace(format)
+	if len(format) > 0 && !bytes.Equal(format, []byte("null")) && !bytes.Equal(format, []byte(`""`)) {
+		return "CMF models do not support constrained output"
+	}
+	if logprobs || topLogprobs > 0 {
+		return "CMF models do not support log probabilities"
+	}
+	return ""
+}
+
+// cmfContextControlError rejects caller-supplied context controls rather than
+// pretending Cortiq applied Ollama's token-accurate truncation or shifting.
+// Nil keeps the ordinary API default, which this adapter documents as owned by
+// the CMF model/runtime rather than by Ollama.
+func cmfContextControlError(truncate, shift *bool) string {
+	var unsupported []string
+	if truncate != nil {
+		unsupported = append(unsupported, "truncate")
+	}
+	if shift != nil {
+		unsupported = append(unsupported, "shift")
+	}
+	if len(unsupported) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("CMF models do not support explicit context control(s): %s", strings.Join(unsupported, ", "))
+}
+
+// validateCMFRawCompletionOptionMaps sees the maps before api.Options applies
+// defaults. Completion only has Cortiq's temperature/max_tokens mapping, so
+// even an explicitly supplied value equal to an Ollama default must be
+// rejected instead of silently omitting it from the sidecar request.
+func validateCMFRawCompletionOptionMaps(m *Model, requestOpts map[string]any) error {
+	var unsupported []string
+	seen := make(map[string]struct{})
+	optionMaps := []map[string]any{requestOpts}
+	if m != nil {
+		optionMaps = append([]map[string]any{m.GenerationDefaults, m.Options}, optionMaps...)
+	}
+	for _, options := range optionMaps {
+		for _, key := range []string{"top_p", "seed"} {
+			if _, ok := options[key]; ok {
+				seen[key] = struct{}{}
+			}
+		}
+	}
+	for _, key := range []string{"top_p", "seed"} {
+		if _, ok := seen[key]; ok {
+			unsupported = append(unsupported, key)
+		}
+	}
+	if len(unsupported) == 0 {
+		return nil
+	}
+	return api.StatusError{
+		StatusCode:   http.StatusBadRequest,
+		ErrorMessage: fmt.Sprintf("CMF raw generation does not support option(s): %s", strings.Join(unsupported, ", ")),
+	}
+}
+
+func writeGenerateResponse(c *gin.Context, req api.GenerateRequest, ch <-chan any) {
 	if req.Stream != nil && !*req.Stream {
 		var r api.GenerateResponse
 		var allLogprobs []api.Logprob
@@ -1192,6 +1417,10 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		handleScheduleError(c, req.Model, err)
 		return
 	}
+	if m.IsCMF() {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "CMF models do not support embeddings"})
+		return
+	}
 
 	r, m, opts, err := s.scheduleRunnerForModel(c.Request.Context(), m, []model.Capability{}, req.Options, req.KeepAlive, nil)
 	if err != nil {
@@ -1439,7 +1668,17 @@ func (s *Server) EmbeddingsHandler(c *gin.Context) {
 
 	name := modelRef.Name
 
-	r, m, _, err := s.scheduleRunner(c.Request.Context(), name.String(), req.Runner, []model.Capability{}, req.Options, req.KeepAlive, nil)
+	m, err := s.getExistingModelForRunner(name.String(), req.Runner)
+	if err != nil {
+		handleScheduleError(c, req.Model, err)
+		return
+	}
+	if m.IsCMF() {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "CMF models do not support embeddings"})
+		return
+	}
+
+	r, m, _, err := s.scheduleRunnerForModel(c.Request.Context(), m, []model.Capability{}, req.Options, req.KeepAlive, nil)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
 		return
@@ -1521,7 +1760,7 @@ func (s *Server) PullHandler(c *gin.Context) {
 		defer cancel()
 
 		if err := PullModel(ctx, name.DisplayShortest(), runner, regOpts, fn); err != nil {
-			ch <- gin.H{"error": err.Error()}
+			ch <- registryOperationError(err)
 			return
 		}
 
@@ -1581,7 +1820,7 @@ func (s *Server) PushHandler(c *gin.Context) {
 		}
 
 		if err := PushModel(ctx, name.DisplayShortest(), regOpts, fn); err != nil {
-			ch <- gin.H{"error": err.Error()}
+			ch <- registryOperationError(err)
 		}
 	}()
 
@@ -1917,11 +2156,15 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	templateText := ""
+	if !m.IsCMF() && m.Template != nil {
+		templateText = m.Template.String()
+	}
 
 	resp := &api.ShowResponse{
 		License:      strings.Join(m.License, "\n"),
 		System:       m.System,
-		Template:     m.Template.String(),
+		Template:     templateText,
 		Details:      modelDetails,
 		Messages:     msgs,
 		Capabilities: m.publicCapabilities(),
@@ -1989,7 +2232,7 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 	var sb strings.Builder
 	fmt.Fprintln(&sb, "# Modelfile generated by \"ollama show\"")
 	modelfile := m.String()
-	if m.IsMLX() {
+	if m.IsMLX() || m.IsCMF() {
 		fmt.Fprintf(&sb, "FROM %s\n", m.ShortName)
 		if _, rest, ok := strings.Cut(modelfile, "\n"); ok {
 			fmt.Fprint(&sb, rest)
@@ -2003,6 +2246,11 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 
 	// skip loading tensor information if this is a remote model
 	if m.Config.RemoteHost != "" && m.Config.RemoteModel != "" {
+		return resp, nil
+	}
+
+	// CMF is an opaque runner-native format and has no GGUF metadata to show.
+	if m.IsCMF() {
 		return resp, nil
 	}
 
@@ -2560,6 +2808,19 @@ func Serve(ln net.Listener) error {
 	return nil
 }
 
+// registryOperationError preserves the API's normal asynchronous-error
+// envelope while making a deliberate local-only CMF policy rejection a client
+// error rather than an indistinguishable server failure. These two errors are
+// known before any registry progress is emitted, so both streamed and
+// non-streamed requests can still carry the HTTP status.
+func registryOperationError(err error) gin.H {
+	response := gin.H{"error": err.Error()}
+	if errors.Is(err, errCMFRemotePull) || errors.Is(err, errCMFRegistryPush) {
+		response["status"] = http.StatusBadRequest
+	}
+	return response
+}
+
 func waitForStream(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/json")
 	var latest api.ProgressResponse
@@ -2587,7 +2848,7 @@ func waitForStream(c *gin.Context, ch chan any) {
 	c.JSON(http.StatusOK, latest)
 }
 
-func streamResponse(c *gin.Context, ch chan any) {
+func streamResponse(c *gin.Context, ch <-chan any) {
 	c.Header("Content-Type", "application/x-ndjson")
 	c.Stream(func(w io.Writer) bool {
 		val, ok := <-ch
@@ -2891,6 +3152,11 @@ const (
 )
 
 func chatModeForModel(m *Model) chatExecutionMode {
+	// The CMF runner owns chat formatting and tokenization. Keep CMF on the
+	// native path even when a template, renderer, or parser is present.
+	if m.IsCMF() {
+		return chatExecutionModeNative
+	}
 	if m.IsMLX() || usesOllamaRenderedChat(m) {
 		return chatExecutionModeRendered
 	}
@@ -3151,6 +3417,25 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		return
 	}
 
+	if m.IsCMF() {
+		if message := cmfOutputRequestError(req.Format, req.Logprobs, req.TopLogprobs); message != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": message})
+			return
+		}
+		if message := cmfContextControlError(req.Truncate, req.Shift); message != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": message})
+			return
+		}
+		if req.DebugRenderOnly {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "CMF models do not expose rendered prompts"})
+			return
+		}
+		if countChatImages(m.Messages)+countChatImages(req.Messages) > 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "CMF models do not support chat images"})
+			return
+		}
+	}
+
 	thinking := m.genericThinking()
 	if thinking == nil {
 		if err := api.ValidateLegacyThinking(req.Think); err != nil {
@@ -3242,7 +3527,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	}
 
 	truncate := req.Truncate == nil || *req.Truncate
-	if m.IsMLX() {
+	if m.IsMLX() || m.IsCMF() {
 		truncate = false
 	}
 	promptOpts := optionsForPrompt(opts, r)
@@ -3401,12 +3686,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 		if err != nil {
 			s.sched.expireRunnersForRuntimeOOM(m, err)
-			var serr api.StatusError
-			if errors.As(err, &serr) {
-				ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
-			} else {
-				ch <- gin.H{"error": err.Error()}
-			}
+			ch <- runnerErrorResponse(err)
 		}
 	}()
 
@@ -3420,14 +3700,27 @@ func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, 
 }
 
 func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model, r llm.LlamaServer, opts *api.Options, msgs []api.Message, checkpointStart, checkpointLoaded time.Time) {
-	truncate := req.Truncate == nil || *req.Truncate
+	// CMF owns its tokenization and chat-template handling, so Ollama must not
+	// call ApplyChatTemplate or Tokenize to trim its messages.
+	if m.IsCMF() && req.DebugRenderOnly {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CMF models do not expose rendered prompts"})
+		return
+	}
+	truncate := (req.Truncate == nil || *req.Truncate) && !m.IsCMF()
+	shift := req.Shift == nil || *req.Shift
+	if m.IsCMF() {
+		// CMF has no Ollama-compatible context shifting. Explicit controls
+		// were rejected before scheduling, so never forward an implicit default
+		// as if it had been honored.
+		shift = false
+	}
 	nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
 		Messages:    msgs,
 		Tools:       req.Tools,
 		Format:      req.Format,
 		Options:     opts,
 		Think:       req.Think,
-		Shift:       req.Shift == nil || *req.Shift,
+		Shift:       shift,
 		Logprobs:    req.Logprobs,
 		TopLogprobs: req.TopLogprobs,
 	}, truncate)
@@ -3499,12 +3792,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		})
 		if err != nil {
 			s.sched.expireRunnersForRuntimeOOM(m, err)
-			var serr api.StatusError
-			if errors.As(err, &serr) {
-				ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
-			} else {
-				ch <- gin.H{"error": err.Error()}
-			}
+			ch <- runnerErrorResponse(err)
 		}
 	}()
 
@@ -3579,7 +3867,14 @@ func countChatImages(msgs []api.Message) int {
 }
 
 func handleScheduleError(c *gin.Context, name string, err error) {
+	var statusErr api.StatusError
 	switch {
+	case errors.Is(err, cmfrunner.ErrRuntimeUnavailable):
+		// The configured runtime path can contain private host details. Return a
+		// stable actionable error instead of leaking the wrapped lookup failure.
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": cmfrunner.ErrRuntimeUnavailable.Error()})
+	case errors.Is(err, cmfrunner.ErrRuntimeConfiguration):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": cmfrunner.ErrRuntimeConfiguration.Error()})
 	case errors.Is(err, errCapabilities), errors.Is(err, errRequired):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, manifest.ErrNoCompatibleManifest):
@@ -3590,9 +3885,22 @@ func handleScheduleError(c *gin.Context, name string, err error) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 	case errors.Is(err, os.ErrNotExist):
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model %q not found, try pulling it first", name)})
+	case errors.As(err, &statusErr):
+		c.JSON(statusErr.StatusCode, gin.H{"error": statusErr.ErrorMessage})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
+}
+
+func runnerErrorResponse(err error) gin.H {
+	var statusErr api.StatusError
+	if errors.As(err, &statusErr) {
+		return gin.H{"error": statusErr.ErrorMessage, "status": statusErr.StatusCode}
+	}
+	if errors.Is(err, cmfrunner.ErrUnsupported) {
+		return gin.H{"error": err.Error(), "status": http.StatusBadRequest}
+	}
+	return gin.H{"error": err.Error()}
 }
 
 func chatMessagesForRequest(m *Model, requestMessages []api.Message) []api.Message {

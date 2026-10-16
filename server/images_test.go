@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -783,6 +784,588 @@ func TestPullModelManifestListDownloadsSelectedChildOnly(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("unselected child manifest blob exists: %v", err)
 	}
+}
+
+// Remote CMF delivery is deliberately unsupported: local CREATE performs the
+// envelope and overlay validation that a registry pull cannot safely defer.
+// These tests make the boundary fail closed before a model layer or named
+// manifest can be written, including when a registry lies in its manifest
+// runner/format fields and only identifies CMF in the config blob.
+func TestPullModelRejectsRemoteCMF(t *testing.T) {
+	mustMarshal := func(t *testing.T, value any) []byte {
+		t.Helper()
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	assertNotVisible := func(t *testing.T, name string) {
+		t.Helper()
+		if _, err := manifest.ReadManifestData(model.ParseName(name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("named manifest was written despite rejected CMF pull: %v", err)
+		}
+	}
+
+	t.Run("declared by a direct manifest", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+		mf := manifest.Manifest{
+			SchemaVersion: 2,
+			MediaType:     manifest.MediaTypeManifest,
+			Runner:        manifest.RunnerCMF,
+			Format:        manifest.FormatCMF,
+			Config: manifest.Layer{
+				MediaType: manifest.MediaTypeImageConfig,
+				Digest:    "sha256:" + strings.Repeat("a", 64),
+				Size:      1,
+			},
+			Layers: []manifest.Layer{{
+				MediaType: manifest.MediaTypeImageModel,
+				Digest:    "sha256:" + strings.Repeat("b", 64),
+				Size:      1,
+			}},
+		}
+		data := mustMarshal(t, mf)
+		var blobRequests atomic.Int32
+		var progressEvents atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/v2/library/test/manifests/latest":
+				w.Header().Set("Content-Type", manifest.MediaTypeManifest)
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				_, _ = w.Write(data)
+			case strings.HasPrefix(r.URL.Path, "/v2/library/test/blobs/"):
+				blobRequests.Add(1)
+				http.Error(w, "CMF pull must reject before blobs", http.StatusInternalServerError)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ts.Close()
+
+		name := strings.TrimPrefix(ts.URL, "http://") + "/library/test:latest"
+		err := PullModel(t.Context(), name, "", &registryOptions{Insecure: true}, func(api.ProgressResponse) {
+			progressEvents.Add(1)
+		})
+		if !errors.Is(err, errCMFRemotePull) {
+			t.Fatalf("PullModel = %v, want errCMFRemotePull", err)
+		}
+		if got := progressEvents.Load(); got != 0 {
+			t.Fatalf("CMF pull emitted %d progress event(s) before rejection, want 0", got)
+		}
+		if got := blobRequests.Load(); got != 0 {
+			t.Fatalf("CMF pull requested %d blob(s), want 0", got)
+		}
+		assertNotVisible(t, name)
+	})
+
+	t.Run("declared by a manifest-list reference", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+		childDigest := "sha256:" + strings.Repeat("c", 64)
+		child, err := manifest.NewManifestReference(childDigest, manifest.RunnerCMF, manifest.FormatCMF)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent := manifest.Manifest{
+			SchemaVersion: 2,
+			MediaType:     manifest.MediaTypeManifestList,
+			Manifests:     []manifest.Manifest{child},
+		}
+		data := mustMarshal(t, parent)
+		var blobRequests atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/v2/library/test/manifests/latest":
+				w.Header().Set("Content-Type", manifest.MediaTypeManifestList)
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				_, _ = w.Write(data)
+			case strings.HasPrefix(r.URL.Path, "/v2/library/test/blobs/"):
+				blobRequests.Add(1)
+				http.Error(w, "CMF pull must reject before the selected child", http.StatusInternalServerError)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ts.Close()
+
+		name := strings.TrimPrefix(ts.URL, "http://") + "/library/test:latest"
+		err = PullModel(t.Context(), name, manifest.RunnerCMF, &registryOptions{Insecure: true}, func(api.ProgressResponse) {})
+		if !errors.Is(err, errCMFRemotePull) {
+			t.Fatalf("PullModel = %v, want errCMFRemotePull", err)
+		}
+		if got := blobRequests.Load(); got != 0 {
+			t.Fatalf("CMF list pull requested %d blob(s), want 0", got)
+		}
+		assertNotVisible(t, name)
+	})
+
+	t.Run("declared by raw manifest-list root metadata", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+		// Manifest.MarshalJSON deliberately omits root metadata for lists, but
+		// registry input is raw JSON and can still carry it.
+		data := mustMarshal(t, map[string]any{
+			"schemaVersion": 2,
+			"mediaType":     manifest.MediaTypeManifestList,
+			"runner":        "cortiq",
+			"format":        manifest.FormatCMF,
+			"manifests":     []any{},
+		})
+		var blobRequests atomic.Int32
+		var progressEvents atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/v2/library/test/manifests/latest":
+				w.Header().Set("Content-Type", manifest.MediaTypeManifestList)
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				_, _ = w.Write(data)
+			case strings.HasPrefix(r.URL.Path, "/v2/library/test/blobs/"):
+				blobRequests.Add(1)
+				http.Error(w, "CMF root metadata must reject before blobs", http.StatusInternalServerError)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ts.Close()
+
+		name := strings.TrimPrefix(ts.URL, "http://") + "/library/test:latest"
+		err := PullModel(t.Context(), name, "", &registryOptions{Insecure: true}, func(api.ProgressResponse) {
+			progressEvents.Add(1)
+		})
+		if !errors.Is(err, errCMFRemotePull) {
+			t.Fatalf("PullModel = %v, want errCMFRemotePull", err)
+		}
+		if got := progressEvents.Load(); got != 0 {
+			t.Fatalf("CMF root list pull emitted %d progress event(s), want 0", got)
+		}
+		if got := blobRequests.Load(); got != 0 {
+			t.Fatalf("CMF root list pull requested %d blob(s), want 0", got)
+		}
+		assertNotVisible(t, name)
+	})
+
+	t.Run("CMF config cannot hide in a raw manifest-list root", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+		configData := mustMarshal(t, model.ConfigV2{ModelFormat: manifest.FormatCMF})
+		configDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(configData))
+		childDigest := "sha256:" + strings.Repeat("e", 64)
+		data := mustMarshal(t, map[string]any{
+			"schemaVersion": 2,
+			"mediaType":     manifest.MediaTypeManifestList,
+			"runner":        manifest.RunnerLlamaCPP,
+			"format":        manifest.FormatGGUF,
+			"config": manifest.Layer{
+				MediaType: manifest.MediaTypeImageConfig,
+				Digest:    configDigest,
+				Size:      int64(len(configData)),
+			},
+			"manifests": []any{map[string]any{
+				"mediaType": manifest.MediaTypeManifest,
+				"digest":    childDigest,
+				"runner":    manifest.RunnerLlamaCPP,
+				"format":    manifest.FormatGGUF,
+			}},
+		})
+		var childBlobRequests atomic.Int32
+		var progressEvents atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/v2/library/test/manifests/latest":
+				w.Header().Set("Content-Type", manifest.MediaTypeManifestList)
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				_, _ = w.Write(data)
+			case (r.Method == http.MethodHead || r.Method == http.MethodGet) && r.URL.Path == "/v2/library/test/blobs/"+configDigest:
+				w.Header().Set("Content-Length", strconv.Itoa(len(configData)))
+				if r.Method == http.MethodGet {
+					_, _ = w.Write(configData)
+				}
+			case strings.HasPrefix(r.URL.Path, "/v2/library/test/blobs/"):
+				childBlobRequests.Add(1)
+				http.Error(w, "CMF root config must reject before child transfer", http.StatusInternalServerError)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ts.Close()
+
+		name := strings.TrimPrefix(ts.URL, "http://") + "/library/test:latest"
+		err := PullModel(t.Context(), name, manifest.RunnerLlamaCPP, &registryOptions{Insecure: true}, func(api.ProgressResponse) {
+			progressEvents.Add(1)
+		})
+		if !errors.Is(err, errCMFRemotePull) {
+			t.Fatalf("PullModel = %v, want errCMFRemotePull", err)
+		}
+		if got := progressEvents.Load(); got != 0 {
+			t.Fatalf("CMF root config pull emitted %d progress event(s), want 0", got)
+		}
+		if got := childBlobRequests.Load(); got != 0 {
+			t.Fatalf("CMF root config pull requested %d child/model blob(s), want 0", got)
+		}
+		assertNotVisible(t, name)
+	})
+
+	t.Run("CMF config cannot be hidden behind ordinary metadata", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+		configData := mustMarshal(t, model.ConfigV2{ModelFormat: manifest.FormatCMF})
+		configDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(configData))
+		modelData := []byte("this CMF model layer must not be fetched")
+		modelDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(modelData))
+		mf := manifest.Manifest{
+			SchemaVersion: 2,
+			MediaType:     manifest.MediaTypeManifest,
+			// A hostile registry claims this is an ordinary llama.cpp GGUF model.
+			Runner: manifest.RunnerLlamaCPP,
+			Format: manifest.FormatGGUF,
+			Config: manifest.Layer{
+				MediaType: manifest.MediaTypeImageConfig,
+				Digest:    configDigest,
+				Size:      int64(len(configData)),
+			},
+			Layers: []manifest.Layer{{
+				MediaType: manifest.MediaTypeImageModel,
+				Digest:    modelDigest,
+				Size:      int64(len(modelData)),
+			}},
+		}
+		manifestData := mustMarshal(t, mf)
+		var modelBlobRequests atomic.Int32
+		var progressEvents atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/v2/library/test/manifests/latest":
+				w.Header().Set("Content-Type", manifest.MediaTypeManifest)
+				w.Header().Set("Content-Length", strconv.Itoa(len(manifestData)))
+				_, _ = w.Write(manifestData)
+			case (r.Method == http.MethodHead || r.Method == http.MethodGet) && r.URL.Path == "/v2/library/test/blobs/"+configDigest:
+				w.Header().Set("Content-Length", strconv.Itoa(len(configData)))
+				if r.Method == http.MethodGet {
+					_, _ = w.Write(configData)
+				}
+			case strings.HasPrefix(r.URL.Path, "/v2/library/test/blobs/"):
+				modelBlobRequests.Add(1)
+				http.Error(w, "model layer must not be fetched", http.StatusInternalServerError)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ts.Close()
+
+		name := strings.TrimPrefix(ts.URL, "http://") + "/library/test:latest"
+		err := PullModel(t.Context(), name, "", &registryOptions{Insecure: true}, func(api.ProgressResponse) {
+			progressEvents.Add(1)
+		})
+		if !errors.Is(err, errCMFRemotePull) {
+			t.Fatalf("PullModel = %v, want errCMFRemotePull", err)
+		}
+		if got := progressEvents.Load(); got != 0 {
+			t.Fatalf("hidden CMF pull emitted %d progress event(s) before rejection, want 0", got)
+		}
+		if got := modelBlobRequests.Load(); got != 0 {
+			t.Fatalf("hidden CMF pull requested %d model blob(s), want 0", got)
+		}
+		assertNotVisible(t, name)
+	})
+
+	t.Run("unreadable config fails closed before model transfer", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+		configData := mustMarshal(t, model.ConfigV2{ModelFormat: manifest.FormatCMF})
+		configDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(configData))
+		modelData := []byte("a model layer that must never be requested")
+		modelDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(modelData))
+		mf := manifest.Manifest{
+			SchemaVersion: 2,
+			MediaType:     manifest.MediaTypeManifest,
+			Runner:        manifest.RunnerLlamaCPP,
+			Format:        manifest.FormatGGUF,
+			Config: manifest.Layer{
+				MediaType: manifest.MediaTypeImageConfig,
+				Digest:    configDigest,
+				Size:      int64(len(configData)),
+			},
+			Layers: []manifest.Layer{{
+				MediaType: manifest.MediaTypeImageModel,
+				Digest:    modelDigest,
+				Size:      int64(len(modelData)),
+			}},
+		}
+		manifestData := mustMarshal(t, mf)
+		var configAvailable atomic.Bool
+		var modelBlobRequests atomic.Int32
+		firstPullCtx, cancelFirstPull := context.WithCancel(t.Context())
+		defer cancelFirstPull()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/v2/library/test/manifests/latest":
+				w.Header().Set("Content-Type", manifest.MediaTypeManifest)
+				w.Header().Set("Content-Length", strconv.Itoa(len(manifestData)))
+				_, _ = w.Write(manifestData)
+			case r.Method == http.MethodGet && r.URL.Path == "/v2/library/test/blobs/"+configDigest:
+				if !configAvailable.Load() {
+					// End the first transfer rather than waiting through the
+					// downloader's retry backoff; the next pull simulates the
+					// registry recovering after a transient config failure.
+					cancelFirstPull()
+					http.Error(w, "config temporarily unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = w.Write(configData)
+			case strings.HasPrefix(r.URL.Path, "/v2/library/test/blobs/"):
+				modelBlobRequests.Add(1)
+				http.Error(w, "model layer must not be fetched", http.StatusInternalServerError)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ts.Close()
+
+		name := strings.TrimPrefix(ts.URL, "http://") + "/library/test:latest"
+		err := PullModel(firstPullCtx, name, "", &registryOptions{Insecure: true}, func(api.ProgressResponse) {})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("PullModel with an unreadable config = %v, want context cancellation", err)
+		}
+		if got := modelBlobRequests.Load(); got != 0 {
+			t.Fatalf("config-preflight failure requested %d model blob(s), want 0", got)
+		}
+		assertNotVisible(t, name)
+
+		// A later successful config request must still inspect the config before
+		// any model transfer, detect CMF, and reject the remote pull.
+		configAvailable.Store(true)
+		err = PullModel(t.Context(), name, "", &registryOptions{Insecure: true}, func(api.ProgressResponse) {})
+		if !errors.Is(err, errCMFRemotePull) {
+			t.Fatalf("PullModel after config recovery = %v, want errCMFRemotePull", err)
+		}
+		if got := modelBlobRequests.Load(); got != 0 {
+			t.Fatalf("recovered config preflight requested %d model blob(s), want 0", got)
+		}
+		assertNotVisible(t, name)
+	})
+}
+
+func TestPullWithTransferRunsGateBeforeManifestPublish(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	payload := []byte("a tensor payload for a pre-publish gate test")
+	digest := fmt.Sprintf("sha256:%x", sha256.Sum256(payload))
+	layer := manifest.Layer{
+		MediaType: manifest.MediaTypeImageTensor,
+		Digest:    digest,
+		Size:      int64(len(payload)),
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/library/test/blobs/"+digest {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		if r.Method == http.MethodGet {
+			_, _ = w.Write(payload)
+		}
+	}))
+	defer ts.Close()
+
+	name := strings.TrimPrefix(ts.URL, "http://") + "/library/test:latest"
+	n := model.ParseName(name)
+	manifestData, err := json.Marshal(manifest.Manifest{
+		SchemaVersion: 2,
+		MediaType:     manifest.MediaTypeManifest,
+		Config: manifest.Layer{
+			MediaType: manifest.MediaTypeImageConfig,
+			Digest:    digest,
+			Size:      int64(len(payload)),
+		},
+		Layers: []manifest.Layer{layer},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateErr := errors.New("reject before manifest publish")
+	gateRan := false
+	err = pullWithTransfer(t.Context(), n, []manifest.Layer{layer}, manifestData, &registryOptions{Insecure: true}, func(api.ProgressResponse) {}, func() error {
+		gateRan = true
+		return gateErr
+	})
+	if !errors.Is(err, gateErr) {
+		t.Fatalf("pullWithTransfer = %v, want pre-publish gate error", err)
+	}
+	if !gateRan {
+		t.Fatal("pre-publish gate was not called")
+	}
+	if _, err := manifest.ReadManifestData(n); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("named manifest was written before gate rejected transfer: %v", err)
+	}
+}
+
+func TestPushModelRejectsCMFBeforeAnyUpload(t *testing.T) {
+	newRegistry := func(t *testing.T) (string, *atomic.Int32, func()) {
+		t.Helper()
+		var requests atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			http.Error(w, "CMF push must reject before any registry request", http.StatusInternalServerError)
+		}))
+		return strings.TrimPrefix(ts.URL, "http://") + "/library/test:latest", &requests, ts.Close
+	}
+
+	assertRejected := func(t *testing.T, name string, requests *atomic.Int32) {
+		t.Helper()
+		var progressEvents atomic.Int32
+		err := PushModel(t.Context(), name, &registryOptions{Insecure: true}, func(api.ProgressResponse) {
+			progressEvents.Add(1)
+		})
+		if !errors.Is(err, errCMFRegistryPush) {
+			t.Fatalf("PushModel = %v, want errCMFRegistryPush", err)
+		}
+		if got := progressEvents.Load(); got != 0 {
+			t.Fatalf("CMF push emitted %d progress event(s) before rejection, want 0", got)
+		}
+		if got := requests.Load(); got != 0 {
+			t.Fatalf("CMF push made %d registry request(s), want 0", got)
+		}
+	}
+
+	t.Run("declared direct manifest", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+		name, requests, closeRegistry := newRegistry(t)
+		defer closeRegistry()
+		n := model.ParseName(name)
+		data, err := json.Marshal(manifest.Manifest{
+			SchemaVersion: 2,
+			MediaType:     manifest.MediaTypeManifest,
+			Runner:        manifest.RunnerCMF,
+			Format:        manifest.FormatCMF,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manifest.WriteManifestData(n, data); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected(t, name, requests)
+	})
+
+	t.Run("CMF hidden in local config", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+		name, requests, closeRegistry := newRegistry(t)
+		defer closeRegistry()
+		n := model.ParseName(name)
+		configData, err := json.Marshal(model.ConfigV2{ModelFormat: manifest.FormatCMF})
+		if err != nil {
+			t.Fatal(err)
+		}
+		configDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(configData))
+		configPath, err := manifest.BlobsPath(configDigest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(manifest.Manifest{
+			SchemaVersion: 2,
+			MediaType:     manifest.MediaTypeManifest,
+			Runner:        manifest.RunnerLlamaCPP,
+			Format:        manifest.FormatGGUF,
+			Config: manifest.Layer{
+				MediaType: manifest.MediaTypeImageConfig,
+				Digest:    configDigest,
+				Size:      int64(len(configData)),
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manifest.WriteManifestData(n, data); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected(t, name, requests)
+	})
+
+	t.Run("declared manifest-list child", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+		name, requests, closeRegistry := newRegistry(t)
+		defer closeRegistry()
+		n := model.ParseName(name)
+		ref, err := manifest.NewManifestReference("sha256:"+strings.Repeat("c", 64), manifest.RunnerCMF, manifest.FormatCMF)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manifest.WriteManifestList(n, []manifest.Manifest{ref}); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected(t, name, requests)
+	})
+
+	t.Run("declared by raw manifest-list root metadata", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+		name, requests, closeRegistry := newRegistry(t)
+		defer closeRegistry()
+		n := model.ParseName(name)
+		data, err := json.Marshal(map[string]any{
+			"schemaVersion": 2,
+			"mediaType":     manifest.MediaTypeManifestList,
+			"runner":        "cortiq",
+			"format":        manifest.FormatCMF,
+			"manifests":     []any{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manifest.WriteManifestData(n, data); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected(t, name, requests)
+	})
+
+	t.Run("CMF hidden in raw manifest-list root config", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+		name, requests, closeRegistry := newRegistry(t)
+		defer closeRegistry()
+		n := model.ParseName(name)
+		configData, err := json.Marshal(model.ConfigV2{ModelFormat: manifest.FormatCMF})
+		if err != nil {
+			t.Fatal(err)
+		}
+		configDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(configData))
+		configPath, err := manifest.BlobsPath(configDigest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(map[string]any{
+			"schemaVersion": 2,
+			"mediaType":     manifest.MediaTypeManifestList,
+			"runner":        manifest.RunnerLlamaCPP,
+			"format":        manifest.FormatGGUF,
+			"config": manifest.Layer{
+				MediaType: manifest.MediaTypeImageConfig,
+				Digest:    configDigest,
+				Size:      int64(len(configData)),
+			},
+			"manifests": []any{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manifest.WriteManifestData(n, data); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected(t, name, requests)
+	})
 }
 
 func TestModelCapabilities(t *testing.T) {

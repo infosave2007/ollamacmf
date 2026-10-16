@@ -1,5 +1,8 @@
 name: test
 
+permissions:
+  contents: read
+
 concurrency:
   # For PRs, later CI runs preempt previous ones. e.g. a force push on a PR
   # cancels running CI jobs and starts all new ones.
@@ -7,7 +10,7 @@ concurrency:
   # For non-PR pushes, concurrency.group needs to be unique for every distinct
   # CI run we want to have happen. Use run_id, which in practice means all
   # non-PR CI runs will be allowed to run without preempting each other.
-  group: ${{ github.workflow }}-$${{ github.pull_request.number || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 on:
@@ -16,6 +19,16 @@ on:
       - '**/*'
       - '!docs/**'
       - '!README.md'
+  # The complete backend matrix needs maintained self-hosted runners labelled
+  # `linux` and `windows`; a fork normally does not have those runners.
+  # This explicit input is for a one-off trusted run after those runners exist.
+  workflow_dispatch:
+    inputs:
+      run_native_build_matrix:
+        description: 'Run the self-hosted Linux/Windows native backend matrix (requires matching trusted runners).'
+        required: true
+        default: false
+        type: boolean
 
 jobs:
   changes:
@@ -25,6 +38,7 @@ jobs:
       app_changed: ${{ steps.changes.outputs.app_changed }}
       go_mod_changed: ${{ steps.changes.outputs.go_mod_changed }}
       enginehash: ${{ steps.changes.outputs.enginehash }}
+      native_build_matrix: ${{ steps.native-build-matrix.outputs.enabled }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,10 +46,17 @@ jobs:
       - id: changes
         run: |
           changed() {
-            local BASE=${{ github.event.pull_request.base.sha }}
-            local HEAD=${{ github.event.pull_request.head.sha }}
-            local MERGE_BASE=$(git merge-base $BASE $HEAD)
-            git diff-tree -r --no-commit-id --name-only "$MERGE_BASE" "$HEAD" \
+            # A trusted manual dispatch deliberately validates the selected
+            # ref in full. pull_request retains the narrow diff-based gate.
+            if [[ "$GITHUB_EVENT_NAME" != 'pull_request' ]]; then
+              printf '%s\n' True
+              return
+            fi
+            local base=${{ github.event.pull_request.base.sha }}
+            local head=${{ github.event.pull_request.head.sha }}
+            local merge_base
+            merge_base=$(git merge-base "$base" "$head")
+            git diff-tree -r --no-commit-id --name-only "$merge_base" "$head" \
               | xargs python3 -c "import sys; from pathlib import Path; print(any(Path(x).match(glob) for x in sys.argv[1:] for glob in '$*'.split(' ')))"
           }
 
@@ -44,7 +65,9 @@ jobs:
             'CMakePresets.json' \
             'cmake/**' \
             'cmake/**/*' \
+            'llama/server/**' \
             'llama/server/**/*' \
+            'llama/compat/**' \
             'llama/compat/**/*' \
             'LLAMA_CPP_VERSION' \
             'MLX_VERSION' \
@@ -58,6 +81,28 @@ jobs:
           echo app_changed=$(changed 'app/**' 'app/**/*') | tee -a $GITHUB_OUTPUT
           echo go_mod_changed=$(changed 'go.mod') | tee -a $GITHUB_OUTPUT
           echo enginehash=$(cat LLAMA_CPP_VERSION)-$(cat MLX_VERSION)-$(cat MLX_C_VERSION) | tee -a $GITHUB_OUTPUT
+      - id: native-build-matrix
+        name: Decide full native backend matrix policy
+        shell: bash
+        env:
+          DISPATCH_NATIVE_BUILD_MATRIX: ${{ inputs.run_native_build_matrix }}
+        run: |
+          enabled=false
+          reason='Disabled for pull requests: the full matrix runs only after an explicit trusted manual dispatch.'
+
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' && "$DISPATCH_NATIVE_BUILD_MATRIX" == 'true' ]]; then
+            enabled=true
+            reason='Enabled by the trusted manual-dispatch input.'
+          fi
+
+          printf 'enabled=%s\n' "$enabled" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Full native backend matrix'
+            echo
+            echo "$reason"
+            echo
+            echo 'The hosted CPU smoke still runs for relevant changes.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   patches:
     strategy:
@@ -80,7 +125,7 @@ jobs:
 
   linux:
     needs: [changes]
-    if: needs.changes.outputs.changed == 'True'
+    if: needs.changes.outputs.changed == 'True' && needs.changes.outputs.native_build_matrix == 'true'
     strategy:
       matrix:
         include:
@@ -182,7 +227,7 @@ jobs:
           test -x "$RUNNER_TEMP/ollama-local/lib/ollama/llama-quantize"
   windows:
     needs: [changes]
-    if: needs.changes.outputs.changed == 'True'
+    if: needs.changes.outputs.changed == 'True' && needs.changes.outputs.native_build_matrix == 'true'
     strategy:
       matrix:
         include:
@@ -350,8 +395,22 @@ jobs:
         if: matrix.superbuild_target
         run: |
           $ErrorActionPreference = "Stop"
-          Import-Module 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
-          Enter-VsDevShell -VsInstallPath 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise' -SkipAutomaticLocation  -DevCmdArguments '-arch=x64 -no_logo'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (!(Test-Path -LiteralPath $vswhere)) {
+            throw "vswhere.exe not found at $vswhere"
+          }
+          $vsInstallPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vsInstallPath)) {
+            throw 'No Visual Studio installation with x64 C++ build tools was found.'
+          }
+          $vsInstallPath = $vsInstallPath.Trim()
+          $devShell = Join-Path $vsInstallPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          if (!(Test-Path -LiteralPath $devShell)) {
+            throw "Visual Studio Developer Shell module not found at $devShell"
+          }
+          Write-Host "Using Visual Studio at $vsInstallPath"
+          Import-Module $devShell
+          Enter-VsDevShell -VsInstallPath $vsInstallPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
           cmake -S . -B "${{ matrix.superbuild_dir }}" ${{ matrix.superbuild_args }}
           $env:CMAKE_BUILD_PARALLEL_LEVEL = [Environment]::ProcessorCount
           cmake --build "${{ matrix.superbuild_dir }}" --target "${{ matrix.superbuild_target }}" -- -l $([Environment]::ProcessorCount)
@@ -378,6 +437,102 @@ jobs:
           if (!(Test-Path "$installPrefix\lib\ollama\llama-quantize.exe")) {
             throw "missing installed llama-quantize.exe"
           }
+  # Keep a real native build on GitHub-hosted runners for every relevant PR.
+  # The much larger GPU matrix above remains an explicit self-hosted opt-in.
+  native_cpu_smoke:
+    name: native CPU smoke (${{ matrix.os }})
+    needs: [changes]
+    if: needs.changes.outputs.changed == 'True'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: |
+            go.sum
+            LLAMA_CPP_VERSION
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # The local Go binary embeds this generated directory, so a native
+      # superbuild must build the UI before it builds the ollama-local target.
+      - name: Build UI
+        working-directory: ./app/ui/app
+        run: |
+          npm ci
+          npm run build
+      - name: Build and verify local CPU payload (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          # The outer target delegates to a nested llama.cpp build. Bound that
+          # build explicitly as well so the hosted runner is not overcommitted.
+          cmake -S . -B build/native-cpu-smoke -G Ninja -DCMAKE_BUILD_TYPE=Release -DOLLAMA_BUILD_PARALLEL=2
+          cmake --build build/native-cpu-smoke --target ollama-local --parallel 2
+          test -x build/native-cpu-smoke/lib/ollama/llama-server
+          test -x build/native-cpu-smoke/lib/ollama/llama-quantize
+          ./ollama --version
+          build/native-cpu-smoke/lib/ollama/llama-server --version
+          cmake --install build/native-cpu-smoke --component ollama-local --prefix "$RUNNER_TEMP/ollama-local"
+          "$RUNNER_TEMP/ollama-local/bin/ollama" --version
+          "$RUNNER_TEMP/ollama-local/lib/ollama/llama-server" --version
+          test -x "$RUNNER_TEMP/ollama-local/lib/ollama/llama-quantize"
+      - name: Build and verify local CPU payload (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install -y --no-progress ninja
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (!(Test-Path -LiteralPath $vswhere)) {
+            throw "vswhere.exe not found at $vswhere"
+          }
+          $vsInstallPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vsInstallPath)) {
+            throw 'No Visual Studio installation with x64 C++ build tools was found.'
+          }
+          $vsInstallPath = $vsInstallPath.Trim()
+          $devShell = Join-Path $vsInstallPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          if (!(Test-Path -LiteralPath $devShell)) {
+            throw "Visual Studio Developer Shell module not found at $devShell"
+          }
+          Write-Host "Using Visual Studio at $vsInstallPath"
+          Import-Module $devShell
+          Enter-VsDevShell -VsInstallPath $vsInstallPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
+          # ExternalProject configures the nested llama-server build with a
+          # fresh cmake invocation. Keep the generator in the environment so
+          # that invocation is Ninja too, rather than CMake's Visual Studio
+          # default (which would use a Debug configuration by default).
+          $env:CMAKE_GENERATOR = 'Ninja'
+          $buildDir = 'build/native-cpu-smoke'
+          # Keep the nested native build bounded too; the outer --parallel flag
+          # does not propagate through the ExternalProject invocation.
+          cmake -S . -B $buildDir -G Ninja -DCMAKE_BUILD_TYPE=Release -DOLLAMA_BUILD_PARALLEL=2
+          cmake --build $buildDir --target ollama-local --parallel 2
+          if (!(Test-Path "$buildDir\lib\ollama\llama-server.exe")) {
+            throw 'missing llama-server.exe'
+          }
+          if (!(Test-Path "$buildDir\lib\ollama\llama-quantize.exe")) {
+            throw 'missing llama-quantize.exe'
+          }
+          & '.\ollama.exe' --version
+          & "$buildDir\lib\ollama\llama-server.exe" --version
+          $installPrefix = Join-Path $env:RUNNER_TEMP 'ollama-local'
+          cmake --install $buildDir --component ollama-local --prefix "$installPrefix"
+          & "$installPrefix\bin\ollama.exe" --version
+          & "$installPrefix\lib\ollama\llama-server.exe" --version
+          if (!(Test-Path "$installPrefix\lib\ollama\llama-quantize.exe")) {
+            throw 'missing installed llama-quantize.exe'
+          }
+
   go_mod_tidy:
     runs-on: ubuntu-latest
     steps:

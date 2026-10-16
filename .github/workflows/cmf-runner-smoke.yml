@@ -1,0 +1,587 @@
+name: Verify CMF candidate inputs
+
+on:
+  pull_request:
+    paths:
+      - 'cmf.lock.json'
+      - '.github/workflows/cmf-release-sync.yml'
+      - '.github/workflows/cmf-runner-smoke.yml'
+      - '.github/scripts/verify_cmf_runtime_archive.py'
+      - '.github/scripts/test_verify_cmf_runtime_archive.py'
+      - 'cmfrunner/**'
+      - 'testdata/cmf/**'
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: 'Immutable CMF candidate commit to validate with trusted default-branch workflow code'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cmf-candidate-inputs-${{ github.event.pull_request.number || inputs.candidate_sha || github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CMF_REPOSITORY: infosave2007/cmf
+  CMF_LOCK_FILE: cmf.lock.json
+  CMF_MAX_ARCHIVE_BYTES: "536870912"
+  CMF_MAX_CHECKSUM_BYTES: "4096"
+
+jobs:
+  verify-release-inputs:
+    outputs:
+      candidate_ref: ${{ steps.candidate-ref.outputs.ref }}
+      trusted_sources: ${{ steps.candidate-ref.outputs.trusted_sources }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Resolve the candidate revision without accepting a ref expression
+        id: candidate-ref
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
+            # This is later bound to the create-only intake branch and its
+            # one-file diff before the candidate checkout is used as data.
+            [[ "$REQUESTED_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo 'workflow_dispatch candidate_sha must be a lowercase 40-hex commit SHA' >&2
+              exit 1
+            }
+            echo "ref=$REQUESTED_CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+            echo 'trusted_sources=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+            echo 'trusted_sources=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      # For workflow_dispatch this is the trusted implementation which
+      # validates candidate data. Pull-request runs retain their usual
+      # read-only candidate-code testing path so this first PR can bootstrap
+      # the workflow before it exists on the default branch.
+      - name: Checkout trusted default-branch sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .cmf-trusted
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind a dispatched candidate to the create-only intake branch
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        working-directory: .cmf-trusted
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate-ref.outputs.ref }}
+          CMF_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$*" >&2
+            exit 1
+          }
+
+          # Fetch a full SHA only after it has passed the strict syntax check.
+          # GitHub serves it only if it is reachable; it is never executed from
+          # this checkout.
+          git fetch --no-tags --depth=2 origin "$CANDIDATE_SHA"
+          git cat-file -e "$CANDIDATE_SHA^{commit}" || fail 'candidate SHA is not a commit'
+
+          read -r -a parents <<< "$(git show -s --format=%P "$CANDIDATE_SHA")"
+          [[ ${#parents[@]} == 1 ]] || fail 'candidate must be a one-parent intake commit'
+          parent="${parents[0]}"
+          git fetch --no-tags origin "refs/heads/$CMF_DEFAULT_BRANCH:refs/remotes/origin/$CMF_DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$parent" "origin/$CMF_DEFAULT_BRANCH" || fail 'candidate parent is not a default-branch ancestor'
+
+          changed=()
+          while IFS= read -r path; do
+            changed+=("$path")
+          done < <(git diff-tree --no-commit-id --name-only -r "$CANDIDATE_SHA")
+          [[ ${#changed[@]} == 1 && "${changed[0]}" == 'cmf.lock.json' ]] || fail 'candidate must change only cmf.lock.json'
+          [[ "$(git cat-file -t "$CANDIDATE_SHA:cmf.lock.json")" == 'blob' ]] || fail 'candidate lock must be a regular Git blob'
+          lock_file="${RUNNER_TEMP}/cmf-dispatch-candidate-lock.json"
+          git show "$CANDIDATE_SHA:cmf.lock.json" > "$lock_file"
+          [[ "$(wc -c < "$lock_file" | tr -d '[:space:]')" =~ ^[1-9][0-9]*$ ]] || fail 'candidate lock is empty'
+          [[ "$(wc -c < "$lock_file" | tr -d '[:space:]')" -le 262144 ]] || fail 'candidate lock is too large'
+
+          jq -e '
+            type == "object" and
+            (.upstream.release.tag | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+            (.upstream.source.commit | type == "string" and test("^[0-9a-f]{40}$"))
+          ' "$lock_file" >/dev/null || fail 'candidate lock cannot identify a CMF release/source commit'
+          tag="$(jq -er '.upstream.release.tag' "$lock_file")"
+          source_commit="$(jq -er '.upstream.source.commit' "$lock_file")"
+          expected_branch="automation/cmf-runtime-${tag}-${source_commit:0:12}"
+          [[ "$expected_branch" =~ ^automation/cmf-runtime-v[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12}$ ]] || fail 'candidate lock produced an unsafe branch name'
+          remote_sha="$(git ls-remote --exit-code origin "refs/heads/$expected_branch" | awk 'NR == 1 { print $1 }')" || fail 'expected candidate branch does not exist'
+          [[ "$remote_sha" == "$CANDIDATE_SHA" ]] || fail 'candidate SHA is not the expected create-only intake branch head'
+
+      # actions/checkout v4.4.0, pinned to its immutable commit.
+      - name: Checkout candidate data
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ steps.candidate-ref.outputs.ref }}
+          # Keep it separate from .cmf-trusted: actions/checkout cleans an
+          # existing root workspace before a root checkout, which would erase
+          # the trusted verifier tree prepared above.
+          path: .cmf-candidate
+          persist-credentials: false
+
+      - name: Test CMF archive-verification utility
+        shell: bash
+        working-directory: .cmf-candidate
+        env:
+          CMF_TRUSTED_SOURCES: ${{ steps.candidate-ref.outputs.trusted_sources }}
+        run: |
+          set -euo pipefail
+          script_root="$PWD"
+          if [[ "$CMF_TRUSTED_SOURCES" == 'true' ]]; then
+            script_root="$GITHUB_WORKSPACE/.cmf-trusted"
+          fi
+          python_bin="$(command -v python3)"
+          isolated_home="${RUNNER_TEMP}/cmf-script-test-home-${GITHUB_RUN_ID}"
+          mkdir -p "$isolated_home"
+          # Candidate verifier code can be exercised on read-only PRs, but it
+          # never inherits Actions credentials. Dispatches use only the trusted
+          # default-branch verifier implementation.
+          env -i PATH="$PATH" HOME="$isolated_home" TMPDIR="$RUNNER_TEMP" \
+            "$python_bin" "$script_root/.github/scripts/test_verify_cmf_runtime_archive.py"
+
+      - name: Validate canonical lock and every pinned runtime archive
+        shell: bash
+        working-directory: .cmf-candidate
+        env:
+          # This job accepts a manually selected workflow ref, so every run
+          # uses unauthenticated public API reads. It never exposes an explicit
+          # GitHub token to candidate-controlled YAML or shell code.
+          CMF_TRUSTED_SOURCES: ${{ steps.candidate-ref.outputs.trusted_sources }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$*" >&2
+            exit 1
+          }
+
+          require_sha256() {
+            local value="$1"
+            local label="$2"
+            [[ "$value" =~ ^[0-9a-f]{64}$ ]] || fail "${label} is not a lowercase SHA-256 digest"
+          }
+
+          require_size_at_most() {
+            local value="$1"
+            local limit="$2"
+            local label="$3"
+            [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "${label} is not a positive integer"
+            # Decimal string comparison avoids arithmetic overflow on a
+            # maliciously oversized lock value before curl is constrained.
+            if (( ${#value} > ${#limit} )) || \
+              { (( ${#value} == ${#limit} )) && [[ "$value" > "$limit" ]]; }; then
+              fail "${label} is ${value} bytes, above the ${limit}-byte limit"
+            fi
+          }
+
+          verify_api_digest() {
+            local api_digest="$1"
+            local actual="$2"
+            local label="$3"
+            if [[ -z "$api_digest" ]]; then
+              echo "GitHub API did not provide a digest for ${label}; using its release checksum asset" >&2
+              return 0
+            fi
+            [[ "$api_digest" =~ ^sha256:([0-9A-Fa-f]{64})$ ]] || fail "unexpected GitHub API digest for ${label}: ${api_digest}"
+            local expected
+            expected="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+            [[ "$expected" == "$actual" ]] || fail "GitHub API digest mismatch for ${label}"
+          }
+
+          api_get() {
+            local -a headers=(
+              --header 'Accept: application/vnd.github+json'
+              --header 'X-GitHub-Api-Version: 2022-11-28'
+            )
+            if [[ -n "${GH_TOKEN:-}" ]]; then
+              headers+=(--header "Authorization: Bearer ${GH_TOKEN}")
+            fi
+            curl --fail --silent --show-error --location \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 90 \
+              "${headers[@]}" "$1"
+          }
+
+          download_asset() {
+            local url="$1"
+            local destination="$2"
+            local maximum_bytes="$3"
+            curl --fail --silent --show-error --location \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 600 \
+              --max-filesize "$maximum_bytes" \
+              --output "$destination" "$url"
+          }
+
+          command -v curl >/dev/null || fail 'curl is required'
+          command -v jq >/dev/null || fail 'jq is required'
+          command -v sha256sum >/dev/null || fail 'sha256sum is required'
+          command -v python3 >/dev/null || fail 'python3 is required'
+          [[ ! -L "$CMF_LOCK_FILE" && -f "$CMF_LOCK_FILE" ]] || fail "${CMF_LOCK_FILE} must be a regular candidate file, not a symlink"
+          script_root="$PWD"
+          if [[ "$CMF_TRUSTED_SOURCES" == 'true' ]]; then
+            script_root="$GITHUB_WORKSPACE/.cmf-trusted"
+          fi
+          verifier="$script_root/.github/scripts/verify_cmf_runtime_archive.py"
+          [[ ! -L "$verifier" && -f "$verifier" ]] || fail 'CMF archive verifier is missing'
+          python_bin="$(command -v python3)"
+          [[ -f "$CMF_LOCK_FILE" ]] || fail "missing ${CMF_LOCK_FILE}"
+
+          # Keep the schema intentionally strict: packaging must not infer a
+          # platform, URL, checksum, or executable name from mutable metadata.
+          jq -e '
+            .schemaVersion == 1 and
+            .engine == {name: "cortiq", modelFormat: "cmf", integrationStatus: "bootstrap"} and
+            .upstream.repository == "infosave2007/cmf" and
+            .upstream.license == "Apache-2.0" and
+            (.upstream.release.tag | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+            (.upstream.release.id | type == "number" and . > 0) and
+            (.upstream.release.publishedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+            (.upstream.release.draft == false) and
+            (.upstream.release.prerelease == false) and
+            (.upstream.release.immutable | type == "boolean") and
+            (.upstream.source.annotatedTagObject | test("^[0-9a-f]{40}$")) and
+            (.upstream.source.commit | test("^[0-9a-f]{40}$")) and
+            (.upstream.source.tagSignature.verified | type == "boolean") and
+            (.upstream.source.tagSignature.reason | type == "string" and length > 0) and
+            (.e2eFixture | type == "object" and
+              (.path | type == "string" and test("^testdata/cmf/[A-Za-z0-9._-]+\\.cmf$")) and
+              (.provenance | type == "string" and test("^testdata/cmf/[A-Za-z0-9._-]+\\.provenance\\.json$")) and
+              (.runtimeTag | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+              (.sourceCommit | test("^[0-9a-f]{40}$")) and
+              (.license == "Apache-2.0") and
+              (.sizeBytes | type == "number" and . > 0) and
+              (.sha256 | test("^[0-9a-f]{64}$"))) and
+            (.artifacts | type == "array" and length == 5) and
+            all(.artifacts[];
+              (.archive.sizeBytes | type == "number" and floor == . and . > 0 and . <= 536870912) and
+              (.checksum.sizeBytes | type == "number" and floor == . and . > 0 and . <= 4096)) and
+            (.unsupportedPlatforms | type == "array" and length == 1) and
+            (.unsupportedPlatforms[0].platform == "linux/arm64") and
+            (.validation.validatedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+            (.validation.checks | type == "array" and length > 0) and
+            (.validation.provenance | type == "string" and length > 0)
+          ' "$CMF_LOCK_FILE" >/dev/null || fail "${CMF_LOCK_FILE} does not satisfy schema 1"
+
+          tag="$(jq -er '.upstream.release.tag' "$CMF_LOCK_FILE")"
+          release_id="$(jq -er '.upstream.release.id' "$CMF_LOCK_FILE")"
+          release_url="$(jq -er '.upstream.release.url' "$CMF_LOCK_FILE")"
+          published_at="$(jq -er '.upstream.release.publishedAt' "$CMF_LOCK_FILE")"
+          release_immutable="$(jq -r '.upstream.release.immutable' "$CMF_LOCK_FILE")"
+          annotated_tag_object="$(jq -er '.upstream.source.annotatedTagObject' "$CMF_LOCK_FILE")"
+          source_commit="$(jq -er '.upstream.source.commit' "$CMF_LOCK_FILE")"
+          tag_signature_verified="$(jq -r '.upstream.source.tagSignature.verified' "$CMF_LOCK_FILE")"
+          tag_signature_reason="$(jq -er '.upstream.source.tagSignature.reason' "$CMF_LOCK_FILE")"
+          [[ "$release_url" == "https://github.com/${CMF_REPOSITORY}/releases/tag/${tag}" ]] || fail 'release URL is not the expected CMF release URL'
+
+          fixture_path="$(jq -er '.e2eFixture.path' "$CMF_LOCK_FILE")"
+          fixture_provenance="$(jq -er '.e2eFixture.provenance' "$CMF_LOCK_FILE")"
+          fixture_tag="$(jq -er '.e2eFixture.runtimeTag' "$CMF_LOCK_FILE")"
+          fixture_source_commit="$(jq -er '.e2eFixture.sourceCommit' "$CMF_LOCK_FILE")"
+          fixture_size="$(jq -er '.e2eFixture.sizeBytes' "$CMF_LOCK_FILE")"
+          fixture_sha256="$(jq -er '.e2eFixture.sha256' "$CMF_LOCK_FILE")"
+          [[ "$fixture_tag" == "$tag" ]] || fail 'reviewed CMF E2E fixture does not match the locked runtime tag; regenerate and review it explicitly'
+          [[ "$fixture_source_commit" == "$source_commit" ]] || fail 'reviewed CMF E2E fixture does not match the locked source commit'
+          [[ ! -L "$fixture_path" && -f "$fixture_path" ]] || fail 'CMF E2E fixture must be a tracked regular file, not a symlink'
+          [[ ! -L "$fixture_provenance" && -f "$fixture_provenance" ]] || fail 'CMF E2E provenance must be a tracked regular file, not a symlink'
+          [[ "$(wc -c < "$fixture_path" | tr -d '[:space:]')" == "$fixture_size" ]] || fail 'CMF E2E fixture size differs from lock'
+          [[ "$(sha256sum "$fixture_path" | awk '{print $1}')" == "$fixture_sha256" ]] || fail 'CMF E2E fixture SHA-256 differs from lock'
+          jq -e --arg tag "$tag" --arg commit "$source_commit" --arg path "$fixture_path" --arg sha256 "$fixture_sha256" --argjson size "$fixture_size" '
+            .schemaVersion == 1 and
+            .license == "Apache-2.0" and
+            .runtime.releaseTag == $tag and
+            .runtime.sourceCommit == $commit and
+            .generator.sourceCommit == $commit and
+            .artifact.path == $path and
+            .artifact.sha256 == $sha256 and
+            .artifact.sizeBytes == $size
+          ' "$fixture_provenance" >/dev/null || fail 'CMF E2E provenance does not match the canonical lock'
+
+          workdir="${RUNNER_TEMP}/cmf-candidate-inputs-${GITHUB_RUN_ID}"
+          mkdir -p "$workdir"
+          release_json="${workdir}/release.json"
+          api_get "https://api.github.com/repos/${CMF_REPOSITORY}/releases/tags/${tag}" > "$release_json"
+
+          [[ "$(jq -er '.id' "$release_json")" == "$release_id" ]] || fail 'locked release id no longer matches GitHub'
+          [[ "$(jq -er '.tag_name' "$release_json")" == "$tag" ]] || fail 'locked tag no longer matches GitHub'
+          [[ "$(jq -er '.published_at' "$release_json")" == "$published_at" ]] || fail 'locked publishedAt no longer matches GitHub'
+          [[ "$(jq -er '.draft | not' "$release_json")" == 'true' ]] || fail 'locked release is now a draft'
+          [[ "$(jq -er '.prerelease | not' "$release_json")" == 'true' ]] || fail 'locked release is now a prerelease'
+          [[ "$(jq -er '.html_url' "$release_json")" == "$release_url" ]] || fail 'locked release URL no longer matches GitHub'
+          [[ "$(jq -r '.immutable | if type == "boolean" then . else error("immutable must be a boolean") end' "$release_json")" == "$release_immutable" ]] || fail 'locked release immutability state no longer matches GitHub'
+
+          tag_ref_json="${workdir}/tag-ref.json"
+          api_get "https://api.github.com/repos/${CMF_REPOSITORY}/git/ref/tags/${tag}" > "$tag_ref_json"
+          [[ "$(jq -er '.object.type' "$tag_ref_json")" == 'tag' ]] || fail 'locked CMF release no longer uses an annotated tag'
+          [[ "$(jq -er '.object.sha' "$tag_ref_json")" == "$annotated_tag_object" ]] || fail 'locked annotated tag object no longer matches GitHub'
+          tag_object_json="${workdir}/tag-object.json"
+          api_get "https://api.github.com/repos/${CMF_REPOSITORY}/git/tags/${annotated_tag_object}" > "$tag_object_json"
+          [[ "$(jq -er '.object.type' "$tag_object_json")" == 'commit' ]] || fail 'locked annotated tag no longer points directly to a commit'
+          [[ "$(jq -er '.object.sha' "$tag_object_json")" == "$source_commit" ]] || fail 'locked source commit no longer matches CMF tag'
+          [[ "$(jq -r '.verification.verified' "$tag_object_json")" == "$tag_signature_verified" ]] || fail 'locked tag verification state no longer matches GitHub'
+          [[ "$(jq -er '.verification.reason' "$tag_object_json")" == "$tag_signature_reason" ]] || fail 'locked tag verification reason no longer matches GitHub'
+
+          asset_count() {
+            local name="$1"
+            jq -er --arg name "$name" '[.assets[] | select(.name == $name)] | length' "$release_json"
+          }
+
+          asset_field() {
+            local name="$1"
+            local field="$2"
+            jq -er --arg name "$name" --arg field "$field" \
+              '[.assets[] | select(.name == $name)] | .[0] | .[$field]' "$release_json"
+          }
+
+          # platform | upstream target | archive | format | sole executable entry
+          platform_specs=(
+            'linux/amd64|x86_64-unknown-linux-gnu|cortiq-x86_64-unknown-linux-gnu.tar.gz|tar.gz|cortiq'
+            'darwin/arm64|aarch64-apple-darwin|cortiq-aarch64-apple-darwin.tar.gz|tar.gz|cortiq'
+            'darwin/amd64|x86_64-apple-darwin|cortiq-x86_64-apple-darwin.tar.gz|tar.gz|cortiq'
+            'windows/amd64|x86_64-pc-windows-msvc|cortiq-x86_64-pc-windows-msvc.zip|zip|cortiq.exe'
+            'windows/arm64|aarch64-pc-windows-msvc|cortiq-aarch64-pc-windows-msvc.zip|zip|cortiq.exe'
+          )
+          linux_arm64_archive='cortiq-aarch64-unknown-linux-gnu.tar.gz'
+          [[ "$(asset_count "$linux_arm64_archive")" == '0' ]] || fail "${linux_arm64_archive} is now available; review the platform scope instead of accepting a stale unsupported-platform lock"
+
+          for spec in "${platform_specs[@]}"; do
+            IFS='|' read -r platform target archive format executable <<< "$spec"
+            checksum_asset="${archive}.sha256"
+
+            lock_count="$(jq -er --arg platform "$platform" '[.artifacts[] | select(.platform == $platform)] | length' "$CMF_LOCK_FILE")"
+            [[ "$lock_count" == '1' ]] || fail "expected exactly one locked artifact for ${platform}"
+            artifact="$(jq -ce --arg platform "$platform" '[.artifacts[] | select(.platform == $platform)] | .[0]' "$CMF_LOCK_FILE")"
+
+            [[ "$(jq -er '.upstreamTarget' <<< "$artifact")" == "$target" ]] || fail "wrong target for ${platform}"
+            [[ "$(jq -er '.status' <<< "$artifact")" == 'initial-packaging-scope' ]] || fail "wrong packaging status for ${platform}"
+            [[ "$(jq -er '.archive.name' <<< "$artifact")" == "$archive" ]] || fail "wrong archive name for ${platform}"
+            [[ "$(jq -er '.archive.format' <<< "$artifact")" == "$format" ]] || fail "wrong archive format for ${platform}"
+            [[ "$(jq -er '.installedExecutable' <<< "$artifact")" == "$executable" ]] || fail "wrong installed executable for ${platform}"
+            [[ "$(jq -cer '.archive.entries' <<< "$artifact")" == "[\"${executable}\"]" ]] || fail "wrong archive entries for ${platform}"
+            [[ "$(jq -er '.checksum.name' <<< "$artifact")" == "$checksum_asset" ]] || fail "wrong checksum asset for ${platform}"
+
+            archive_url="$(jq -er '.archive.url' <<< "$artifact")"
+            checksum_url="$(jq -er '.checksum.url' <<< "$artifact")"
+            archive_id="$(jq -er '.archive.releaseAssetId' <<< "$artifact")"
+            checksum_id="$(jq -er '.checksum.releaseAssetId' <<< "$artifact")"
+            archive_size="$(jq -er '.archive.sizeBytes' <<< "$artifact")"
+            checksum_size="$(jq -er '.checksum.sizeBytes' <<< "$artifact")"
+            archive_sha256="$(jq -er '.archive.sha256' <<< "$artifact")"
+            checksum_asset_sha256="$(jq -er '.checksum.sha256' <<< "$artifact")"
+            [[ "$archive_id" =~ ^[1-9][0-9]*$ && "$checksum_id" =~ ^[1-9][0-9]*$ ]] || fail "invalid locked asset id for ${platform}"
+            [[ "$archive_size" =~ ^[1-9][0-9]*$ && "$checksum_size" =~ ^[1-9][0-9]*$ ]] || fail "invalid locked asset size for ${platform}"
+            require_size_at_most "$archive_size" "$CMF_MAX_ARCHIVE_BYTES" "locked archive ${archive}"
+            require_size_at_most "$checksum_size" "$CMF_MAX_CHECKSUM_BYTES" "locked checksum ${checksum_asset}"
+            require_sha256 "$archive_sha256" "archive SHA-256 for ${platform}"
+            require_sha256 "$checksum_asset_sha256" "checksum asset SHA-256 for ${platform}"
+            [[ "$archive_url" == "https://github.com/${CMF_REPOSITORY}/releases/download/${tag}/${archive}" ]] || fail "wrong archive URL for ${platform}"
+            [[ "$checksum_url" == "https://github.com/${CMF_REPOSITORY}/releases/download/${tag}/${checksum_asset}" ]] || fail "wrong checksum URL for ${platform}"
+
+            [[ "$(asset_count "$archive")" == '1' ]] || fail "GitHub no longer has exactly one ${archive}"
+            [[ "$(asset_count "$checksum_asset")" == '1' ]] || fail "GitHub no longer has exactly one ${checksum_asset}"
+            [[ "$(asset_field "$archive" id)" == "$archive_id" ]] || fail "archive id changed for ${platform}"
+            [[ "$(asset_field "$checksum_asset" id)" == "$checksum_id" ]] || fail "checksum asset id changed for ${platform}"
+            [[ "$(asset_field "$archive" size)" == "$archive_size" ]] || fail "archive size changed for ${platform}"
+            [[ "$(asset_field "$checksum_asset" size)" == "$checksum_size" ]] || fail "checksum size changed for ${platform}"
+            [[ "$(asset_field "$archive" state)" == 'uploaded' ]] || fail "archive is not uploaded for ${platform}"
+            [[ "$(asset_field "$checksum_asset" state)" == 'uploaded' ]] || fail "checksum asset is not uploaded for ${platform}"
+            [[ "$(asset_field "$archive" browser_download_url)" == "$archive_url" ]] || fail "archive URL changed for ${platform}"
+            [[ "$(asset_field "$checksum_asset" browser_download_url)" == "$checksum_url" ]] || fail "checksum URL changed for ${platform}"
+
+            archive_api_digest="$(jq -r --arg name "$archive" '[.assets[] | select(.name == $name)] | .[0].digest // empty' "$release_json")"
+            checksum_api_digest="$(jq -r --arg name "$checksum_asset" '[.assets[] | select(.name == $name)] | .[0].digest // empty' "$release_json")"
+            archive_path="${workdir}/${archive}"
+            checksum_path="${workdir}/${checksum_asset}"
+            download_asset "$archive_url" "$archive_path" "$CMF_MAX_ARCHIVE_BYTES"
+            download_asset "$checksum_url" "$checksum_path" "$CMF_MAX_CHECKSUM_BYTES"
+            [[ "$(wc -c < "$archive_path" | tr -d '[:space:]')" == "$archive_size" ]] || fail "downloaded ${archive} size differs from lock"
+            [[ "$(wc -c < "$checksum_path" | tr -d '[:space:]')" == "$checksum_size" ]] || fail "downloaded ${checksum_asset} size differs from lock"
+
+            actual_archive_sha256="$(sha256sum "$archive_path" | awk '{print $1}')"
+            actual_checksum_asset_sha256="$(sha256sum "$checksum_path" | awk '{print $1}')"
+            require_sha256 "$actual_archive_sha256" "downloaded ${archive}"
+            require_sha256 "$actual_checksum_asset_sha256" "downloaded ${checksum_asset}"
+            [[ "$actual_archive_sha256" == "$archive_sha256" ]] || fail "downloaded ${archive} does not match lock"
+            [[ "$actual_checksum_asset_sha256" == "$checksum_asset_sha256" ]] || fail "downloaded ${checksum_asset} does not match lock"
+            verify_api_digest "$archive_api_digest" "$actual_archive_sha256" "$archive"
+            verify_api_digest "$checksum_api_digest" "$actual_checksum_asset_sha256" "$checksum_asset"
+
+            [[ "$(awk 'END { print NR + 0 }' "$checksum_path")" == '1' ]] || fail "${checksum_asset} must contain exactly one checksum"
+            checksum_line="$(cat "$checksum_path")"
+            checksum_line="${checksum_line%$'\r'}"
+            read -r expected_archive_sha256 checksum_name extra <<< "$checksum_line"
+            [[ -n "${expected_archive_sha256:-}" && -n "${checksum_name:-}" && -z "${extra:-}" ]] || fail "malformed ${checksum_asset}"
+            require_sha256 "$(printf '%s' "$expected_archive_sha256" | tr '[:upper:]' '[:lower:]')" "checksum in ${checksum_asset}"
+            expected_archive_sha256="$(printf '%s' "$expected_archive_sha256" | tr '[:upper:]' '[:lower:]')"
+            checksum_name="${checksum_name#\*}"
+            [[ "$checksum_name" == "$archive" ]] || fail "${checksum_asset} does not describe ${archive}"
+            [[ "$expected_archive_sha256" == "$archive_sha256" ]] || fail "${checksum_asset} and lock disagree for ${archive}"
+
+            env -i PATH="$PATH" HOME="$workdir" TMPDIR="$workdir" \
+              "$python_bin" "$verifier" --archive "$archive_path" --format "$format" --entry "$executable"
+          done
+
+          echo "Verified all five CMF desktop candidate inputs and the matching, reviewed E2E fixture for ${tag}."
+
+
+  verify-downloaded-runner-e2e:
+    name: Exercise Linux Cortiq runner through the adapter
+    needs: verify-release-inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The job executes an upstream binary. It has only the read permission
+    # needed for a reliable checkout; `env -i` below keeps its token/secrets
+    # out of the downloaded process.
+    permissions:
+      contents: read
+    steps:
+      # For a dispatch, this supplies the trusted adapter/test implementation;
+      # the candidate checkout below is then used only for its already-bound
+      # lock and fixture data. It also makes the Go toolchain version depend on
+      # trusted source rather than a caller-supplied SHA.
+      - name: Checkout trusted default-branch sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .cmf-trusted
+          persist-credentials: false
+
+      # actions/checkout v4.4.0, pinned to its immutable commit.
+      - name: Checkout verified candidate data
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.verify-release-inputs.outputs.candidate_ref }}
+          path: .cmf-candidate
+          persist-credentials: false
+
+      # actions/setup-go v5.0.2, pinned to its immutable commit.
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version-file: .cmf-trusted/go.mod
+          cache: false
+
+      - name: Verify, safely extract, and exercise the pinned Linux runner
+        shell: bash
+        env:
+          CMF_TRUSTED_SOURCES: ${{ needs.verify-release-inputs.outputs.trusted_sources }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$*" >&2
+            exit 1
+          }
+
+          require_size_at_most() {
+            local value="$1"
+            local limit="$2"
+            local label="$3"
+            [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "${label} is not a positive integer"
+            # Decimal string comparison avoids arithmetic overflow on a
+            # maliciously oversized lock value before curl is constrained.
+            if (( ${#value} > ${#limit} )) || \
+              { (( ${#value} == ${#limit} )) && [[ "$value" > "$limit" ]]; }; then
+              fail "${label} is ${value} bytes, above the ${limit}-byte limit"
+            fi
+          }
+
+          command -v curl >/dev/null || fail 'curl is required'
+          command -v jq >/dev/null || fail 'jq is required'
+          command -v sha256sum >/dev/null || fail 'sha256sum is required'
+          command -v realpath >/dev/null || fail 'realpath is required'
+          command -v python3 >/dev/null || fail 'python3 is required'
+          candidate_root="$GITHUB_WORKSPACE/.cmf-candidate"
+          lock_file="$candidate_root/cmf.lock.json"
+          [[ ! -L "$lock_file" && -f "$lock_file" ]] || fail 'CMF candidate lock must be a regular file, not a symlink'
+          script_root="$candidate_root"
+          test_root="$candidate_root"
+          if [[ "$CMF_TRUSTED_SOURCES" == 'true' ]]; then
+            script_root="$GITHUB_WORKSPACE/.cmf-trusted"
+            test_root="$GITHUB_WORKSPACE/.cmf-trusted"
+          fi
+          verifier="$script_root/.github/scripts/verify_cmf_runtime_archive.py"
+          [[ ! -L "$verifier" && -f "$verifier" ]] || fail 'CMF archive verifier is missing'
+          python_bin="$(command -v python3)"
+
+          tag="$(jq -er '.upstream.release.tag' "$lock_file")"
+          source_commit="$(jq -er '.upstream.source.commit' "$lock_file")"
+          fixture_rel="$(jq -er '.e2eFixture.path' "$lock_file")"
+          fixture_tag="$(jq -er '.e2eFixture.runtimeTag' "$lock_file")"
+          fixture_commit="$(jq -er '.e2eFixture.sourceCommit' "$lock_file")"
+          fixture_size="$(jq -er '.e2eFixture.sizeBytes' "$lock_file")"
+          fixture_sha256="$(jq -er '.e2eFixture.sha256' "$lock_file")"
+          [[ "$fixture_tag" == "$tag" && "$fixture_commit" == "$source_commit" ]] || fail 'CMF E2E fixture is not reviewed for this runtime lock'
+          [[ "$fixture_rel" =~ ^testdata/cmf/[A-Za-z0-9._-]+\.cmf$ ]] || fail 'CMF E2E fixture path is not a safe tracked fixture path'
+          fixture_path="$candidate_root/$fixture_rel"
+          [[ ! -L "$fixture_path" && -f "$fixture_path" ]] || fail 'CMF E2E fixture must be a regular file, not a symlink'
+          [[ "$(wc -c < "$fixture_path" | tr -d '[:space:]')" == "$fixture_size" ]] || fail 'CMF E2E fixture size differs from lock'
+          [[ "$(sha256sum "$fixture_path" | awk '{print $1}')" == "$fixture_sha256" ]] || fail 'CMF E2E fixture SHA-256 differs from lock'
+          fixture="$(realpath "$fixture_path")"
+
+          artifact="$(jq -ce '[.artifacts[] | select(.platform == "linux/amd64")] | if length == 1 then .[0] else error("missing linux/amd64 artifact") end' "$lock_file")"
+          archive_name="$(jq -er '.archive.name' <<< "$artifact")"
+          archive_url="$(jq -er '.archive.url' <<< "$artifact")"
+          archive_size="$(jq -er '.archive.sizeBytes' <<< "$artifact")"
+          archive_sha256="$(jq -er '.archive.sha256' <<< "$artifact")"
+          archive_format="$(jq -er '.archive.format' <<< "$artifact")"
+          executable="$(jq -er '.installedExecutable' <<< "$artifact")"
+          [[ "$archive_name" == 'cortiq-x86_64-unknown-linux-gnu.tar.gz' ]] || fail 'unexpected Linux archive name'
+          [[ "$archive_url" == "https://github.com/infosave2007/cmf/releases/download/${tag}/${archive_name}" ]] || fail 'unexpected Linux archive URL'
+          [[ "$archive_format" == 'tar.gz' && "$executable" == 'cortiq' ]] || fail 'unexpected Linux runtime layout'
+          [[ "$archive_size" =~ ^[1-9][0-9]*$ && "$archive_sha256" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid locked Linux archive metadata'
+          require_size_at_most "$archive_size" "$CMF_MAX_ARCHIVE_BYTES" 'locked Linux archive'
+
+          workdir="${RUNNER_TEMP}/cmf-downloaded-runner-${GITHUB_RUN_ID}"
+          runtime_dir="${workdir}/runtime"
+          mkdir -p "$runtime_dir"
+          archive_path="${workdir}/${archive_name}"
+          curl --fail --silent --show-error --location \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 600 \
+            --max-filesize "$CMF_MAX_ARCHIVE_BYTES" \
+            --output "$archive_path" "$archive_url"
+          [[ "$(wc -c < "$archive_path" | tr -d '[:space:]')" == "$archive_size" ]] || fail 'downloaded Linux archive size differs from lock'
+          [[ "$(sha256sum "$archive_path" | awk '{print $1}')" == "$archive_sha256" ]] || fail 'downloaded Linux archive SHA-256 differs from lock'
+
+          # The verifier refuses links, special files, multiple payloads, and
+          # oversized/non-executable members before it writes the one runner.
+          env -i PATH="$PATH" HOME="$workdir" TMPDIR="$workdir" \
+            "$python_bin" "$verifier" --archive "$archive_path" --format "$archive_format" --entry "$executable" \
+            --extract-to "$runtime_dir"
+          runner="$(realpath "${runtime_dir}/${executable}")"
+          [[ -x "$runner" ]] || fail 'verified runner was not extracted as an executable'
+
+          isolated_home="${workdir}/home"
+          isolated_tmp="${workdir}/tmp"
+          isolated_go_cache="${workdir}/go-cache"
+          isolated_go_mod_cache="${workdir}/go-mod-cache"
+          mkdir -p "$isolated_home" "$isolated_tmp" "$isolated_go_cache" "$isolated_go_mod_cache"
+          # `env -i` is intentionally immediately around `go test`: the
+          # downloaded process receives only this small, credential-free set.
+          (
+            cd "$test_root"
+            env -i \
+              PATH="$PATH" \
+              HOME="$isolated_home" \
+              TMPDIR="$isolated_tmp" \
+              GOCACHE="$isolated_go_cache" \
+              GOMODCACHE="$isolated_go_mod_cache" \
+              GOMAXPROCS=1 \
+              CMF_E2E=1 \
+              CMF_E2E_MODEL="$fixture" \
+              CMF_SERVE_SLOTS=1 \
+              OLLAMA_CORTIQ_PATH="$runner" \
+              go test -count=1 -p 1 -run '^TestCortiqDownloadedRuntimeE2E$' -timeout 5m ./cmfrunner
+          )

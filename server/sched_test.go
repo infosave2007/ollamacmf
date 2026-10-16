@@ -18,6 +18,7 @@ import (
 	"github.com/ollama/ollama/fs/gguf"
 	gguftest "github.com/ollama/ollama/internal/testutil/gguf"
 	"github.com/ollama/ollama/llm"
+	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/types/model"
 )
@@ -150,6 +151,190 @@ func TestSchedLoad(t *testing.T) {
 	require.Equal(t, uint(0), runner.refCount)
 	time.Sleep(1 * time.Millisecond)
 	require.Len(t, s.expiredCh, 1)
+}
+
+func TestSchedLoadCMFUsesCMFRunnerWithoutGGUFPlacement(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), time.Second)
+	defer done()
+
+	s := InitScheduler(ctx)
+	cmfServer := &mockLlm{modelPath: "/does/not/need/to/be/gguf.cmf", vramByGPU: map[ml.DeviceID]uint64{}}
+	var gotModel string
+	var gotParallel int
+	s.newCMFServerFn = func(modelPath string, numParallel int) (llm.LlamaServer, error) {
+		gotModel = modelPath
+		gotParallel = numParallel
+		return cmfServer, nil
+	}
+
+	req := &LlmRequest{
+		ctx: ctx,
+		model: &Model{
+			ModelPath: "/does/not/need/to-be/gguf.cmf",
+			ShortName: "example-cmf",
+			Config: model.ConfigV2{
+				ModelFormat: manifest.FormatCMF,
+			},
+		},
+		opts:            api.DefaultOptions(),
+		successCh:       make(chan *runnerRef, 1),
+		errCh:           make(chan error, 1),
+		sessionDuration: &api.Duration{Duration: time.Second},
+		contextShift:    true,
+	}
+	gpu := ml.DeviceInfo{DeviceID: ml.DeviceID{Library: "CUDA", ID: "0"}}
+	if needEvict := s.load(req, ml.SystemInfo{}, []ml.DeviceInfo{gpu}, false); needEvict {
+		t.Fatal("CMF load unexpectedly requested eviction")
+	}
+
+	select {
+	case err := <-req.errCh:
+		t.Fatalf("CMF load error = %v", err)
+	case runner := <-req.successCh:
+		require.Equal(t, req.model.ModelPath, gotModel)
+		require.Equal(t, 1, gotParallel, "CMF runs one unaccounted sidecar slot")
+		require.Equal(t, manifest.RunnerCMF, runner.runner)
+		require.Empty(t, runner.gpus, "Cortiq GPU placement must not be invented by Ollama")
+		require.False(t, runner.contextShift, "Cortiq owns CMF context shifting")
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for CMF runner")
+	}
+}
+
+func TestCMFRunnerResidencyIsExclusive(t *testing.T) {
+	cmf := &runnerRef{
+		model: &Model{Config: model.ConfigV2{ModelFormat: manifest.FormatCMF}},
+	}
+	gguf := &runnerRef{
+		model: &Model{Config: model.ConfigV2{ModelFormat: manifest.FormatGGUF}},
+	}
+
+	tests := []struct {
+		name    string
+		pending *Model
+		loaded  map[string]*runnerRef
+		want    *runnerRef
+	}{
+		{
+			name:    "CMF evicts an existing regular runner",
+			pending: &Model{Config: model.ConfigV2{ModelFormat: manifest.FormatCMF}},
+			loaded:  map[string]*runnerRef{"gguf": gguf},
+			want:    gguf,
+		},
+		{
+			name:    "regular runner evicts a resident CMF sidecar",
+			pending: &Model{Config: model.ConfigV2{ModelFormat: manifest.FormatGGUF}},
+			loaded:  map[string]*runnerRef{"cmf": cmf},
+			want:    cmf,
+		},
+		{
+			name:    "resident CMF is preferred when pending CMF finds multiple runners",
+			pending: &Model{Config: model.ConfigV2{ModelFormat: manifest.FormatCMF}},
+			loaded:  map[string]*runnerRef{"gguf": gguf, "cmf": cmf},
+			want:    cmf,
+		},
+		{
+			name:    "regular runners retain normal co-residency policy",
+			pending: &Model{Config: model.ConfigV2{ModelFormat: manifest.FormatGGUF}},
+			loaded:  map[string]*runnerRef{"gguf": gguf},
+			want:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cmfResidencyConflict(tt.pending, tt.loaded); got != tt.want {
+				t.Fatalf("cmfResidencyConflict() = %p, want %p", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCMFRunnerResidencyConflictsUnloadBeforeLoading(t *testing.T) {
+	t.Setenv("OLLAMA_MAX_LOADED_MODELS", "3")
+
+	tests := []struct {
+		name             string
+		residentFormat   string
+		pendingFormat    string
+		residentModelKey string
+		pendingModelKey  string
+	}{
+		{
+			name:             "CMF replaces resident regular runner",
+			residentFormat:   manifest.FormatGGUF,
+			pendingFormat:    manifest.FormatCMF,
+			residentModelKey: "/resident.gguf",
+			pendingModelKey:  "/pending.cmf",
+		},
+		{
+			name:             "regular runner replaces resident CMF sidecar",
+			residentFormat:   manifest.FormatCMF,
+			pendingFormat:    manifest.FormatGGUF,
+			residentModelKey: "/resident.cmf",
+			pendingModelKey:  "/pending.gguf",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+
+			s := InitScheduler(ctx)
+			s.getGpuFn = func(context.Context, []ml.FilteredRunnerDiscovery) []ml.DeviceInfo { return nil }
+			s.getSystemInfoFn = func() ml.SystemInfo { return ml.SystemInfo{} }
+
+			residentModel := &Model{
+				ModelPath: tt.residentModelKey,
+				Config:    model.ConfigV2{ModelFormat: tt.residentFormat},
+			}
+			residentServer := &mockLlm{modelPath: residentModel.ModelPath}
+			resident := &runnerRef{
+				llama:           residentServer,
+				model:           residentModel,
+				modelPath:       residentModel.ModelPath,
+				modelKey:        schedulerModelKey(residentModel),
+				sessionDuration: time.Hour,
+			}
+			s.loadedMu.Lock()
+			s.loaded[resident.modelKey] = resident
+			s.loadedMu.Unlock()
+
+			loadStarted := make(chan int, 1)
+			s.loadFn = func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				s.loadedMu.Lock()
+				remaining := len(s.loaded)
+				s.loadedMu.Unlock()
+				loadStarted <- remaining
+				req.successCh <- &runnerRef{llama: &mockLlm{}}
+				return false
+			}
+			s.Run(ctx)
+
+			pendingModel := &Model{
+				ModelPath: tt.pendingModelKey,
+				Config:    model.ConfigV2{ModelFormat: tt.pendingFormat},
+			}
+			s.pendingReqCh <- &LlmRequest{
+				ctx:       ctx,
+				model:     pendingModel,
+				opts:      api.DefaultOptions(),
+				successCh: make(chan *runnerRef, 1),
+				errCh:     make(chan error, 1),
+			}
+
+			select {
+			case remaining := <-loadStarted:
+				require.Zero(t, remaining, "conflicting runner must be gone before the new load starts")
+				// runner.unload happens-before unloadedCh, which happens-before the
+				// scheduler invokes loadFn and sends loadStarted above.
+				require.True(t, residentServer.closeCalled, "conflicting runner must be closed")
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for conflicting runner to unload")
+			}
+		})
+	}
 }
 
 func TestSchedLoadStoresEffectiveContextLength(t *testing.T) {
@@ -1264,6 +1449,71 @@ func TestSchedAlreadyCanceled(t *testing.T) {
 	require.Empty(t, s.pendingReqCh)
 	require.Empty(t, scenario1a.req.errCh)
 	require.Empty(t, scenario1a.req.successCh)
+}
+
+func TestSchedCancelledCMFRequestDoesNotLoadAfterExclusiveEviction(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), time.Second)
+	defer done()
+	s := InitScheduler(ctx)
+
+	pendingCtx, cancelPending := context.WithCancel(ctx)
+	defer cancelPending()
+	pending := &LlmRequest{
+		ctx: pendingCtx,
+		model: &Model{
+			Name:      "cmf-pending",
+			ModelPath: "/models/pending.cmf",
+			Config:    model.ConfigV2{ModelFormat: manifest.FormatCMF},
+		},
+		opts:      api.DefaultOptions(),
+		successCh: make(chan *runnerRef, 1),
+		errCh:     make(chan error, 1),
+	}
+	resident := &runnerRef{
+		model: &Model{
+			Name:      "regular-resident",
+			ModelPath: "/models/resident.gguf",
+			Config:    model.ConfigV2{ModelFormat: manifest.FormatGGUF},
+		},
+		modelKey: "regular-resident",
+		llama:    &mockLlm{},
+	}
+	s.loadedMu.Lock()
+	s.loaded[resident.modelKey] = resident
+	s.loadedMu.Unlock()
+
+	started := make(chan struct{}, 1)
+	s.newCMFServerFn = func(string, int) (llm.LlamaServer, error) {
+		started <- struct{}{}
+		return &mockLlm{}, nil
+	}
+
+	// Run only the pending loop so the test controls the moment at which the
+	// CMF-exclusive eviction completes.
+	go s.processPending(ctx)
+	s.pendingReqCh <- pending
+	select {
+	case expired := <-s.expiredCh:
+		require.Same(t, resident, expired)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for CMF-exclusive eviction")
+	}
+
+	// This models a caller disconnecting while the scheduler waits for the
+	// resident runner to unload. Releasing the wait must not then start Cortiq.
+	cancelPending()
+	s.loadedMu.Lock()
+	delete(s.loaded, resident.modelKey)
+	s.loadedMu.Unlock()
+	s.unloadedCh <- struct{}{}
+
+	select {
+	case <-started:
+		t.Fatal("cancelled CMF request started a sidecar after exclusive eviction")
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.Empty(t, pending.successCh)
+	require.Empty(t, pending.errCh)
 }
 
 // hasLoadedRunner is a test helper that checks if any runner is loaded.

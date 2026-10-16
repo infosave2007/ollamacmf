@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/cmfrunner"
 	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
@@ -77,6 +78,7 @@ type Scheduler struct {
 
 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
+	newCMFServerFn  func(model string, numParallel int) (llm.LlamaServer, error)
 	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
 	getSystemInfoFn func() ml.SystemInfo
 	waitForRecovery time.Duration
@@ -131,12 +133,15 @@ var ErrMaxQueue = errors.New("server busy, please try again.  maximum pending re
 func InitScheduler(ctx context.Context) *Scheduler {
 	maxQueue := envconfig.MaxQueue()
 	sched := &Scheduler{
-		pendingReqCh:    make(chan *LlmRequest, maxQueue),
-		finishedReqCh:   make(chan *LlmRequest, maxQueue),
-		expiredCh:       make(chan *runnerRef, maxQueue),
-		unloadedCh:      make(chan any, maxQueue),
-		loaded:          make(map[string]*runnerRef),
-		newServerFn:     llm.NewLlamaServer,
+		pendingReqCh:  make(chan *LlmRequest, maxQueue),
+		finishedReqCh: make(chan *LlmRequest, maxQueue),
+		expiredCh:     make(chan *runnerRef, maxQueue),
+		unloadedCh:    make(chan any, maxQueue),
+		loaded:        make(map[string]*runnerRef),
+		newServerFn:   llm.NewLlamaServer,
+		newCMFServerFn: func(model string, numParallel int) (llm.LlamaServer, error) {
+			return cmfrunner.NewClient(model, numParallel)
+		},
 		getGpuFn:        discover.GPUDevices,
 		getSystemInfoFn: discover.GetSystemInfo,
 		waitForRecovery: 5 * time.Second,
@@ -226,7 +231,7 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	}
 
 	contextShift := false
-	if m.ModelPath != "" {
+	if m.ModelPath != "" && !m.IsCMF() {
 		contextShift = resolveContextShift(shift, m)
 	}
 
@@ -259,6 +264,35 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	return req.successCh, req.errCh
 }
 
+// cmfResidencyConflict returns a loaded runner that must be unloaded before a
+// different model can be loaded when either side uses CMF. Cortiq's public
+// runner protocol does not report resource placement or usage, so allowing it
+// to co-reside with a normally-accounted Ollama runner would treat unknown
+// memory use as free. Prefer a resident CMF runner when multiple candidates
+// exist, so a regular runner is not evicted unnecessarily.
+//
+// Callers hold loadedMu. The current model is handled separately before this
+// helper is used, so a same-model runner never conflicts with itself here.
+func cmfResidencyConflict(pending *Model, loaded map[string]*runnerRef) *runnerRef {
+	if pending == nil {
+		return nil
+	}
+
+	var fallback *runnerRef
+	for _, runner := range loaded {
+		if runner == nil || runner.model == nil {
+			continue
+		}
+		if runner.model.IsCMF() {
+			return runner
+		}
+		if pending.IsCMF() {
+			fallback = runner
+		}
+	}
+	return fallback
+}
+
 // Returns immediately, spawns go routines for the scheduler which will shutdown when ctx is done
 func (s *Scheduler) Run(ctx context.Context) {
 	slog.Debug("starting llm scheduler")
@@ -289,7 +323,12 @@ func (s *Scheduler) processPending(ctx context.Context) {
 			}
 			logutil.Trace("processing incoming request", "model", pending.model.ModelPath)
 
+		pendingLoop:
 			for {
+				if err := pending.ctx.Err(); err != nil {
+					slog.Debug("pending request cancelled or timed out while scheduling", "error", err)
+					break pendingLoop
+				}
 				var runnerToExpire *runnerRef
 				pendingKey := schedulerModelKey(pending.model)
 				s.loadedMu.Lock()
@@ -299,6 +338,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				for _, r := range s.loaded {
 					runnersSnapshot = append(runnersSnapshot, r)
 				}
+				cmfConflict := cmfResidencyConflict(pending.model, s.loaded)
 				s.loadedMu.Unlock()
 
 				if runner != nil {
@@ -311,6 +351,12 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						pending.useLoadedRunner(runner, s.finishedReqCh)
 						break
 					}
+				} else if cmfConflict != nil {
+					slog.Info("CMF runner residency is exclusive until Cortiq resource accounting is available",
+						"pending_model", pending.model.ModelPath,
+						"resident_model", cmfConflict.modelPath,
+						"resident_runner", cmfConflict.runner)
+					runnerToExpire = cmfConflict
 				} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
 					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
 					runnerToExpire = s.findRunnerToUnload()
@@ -342,6 +388,10 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					// Update free memory from currently loaded models
 					logutil.Trace("updating free space", "gpu_count", len(gpus), "model", pending.model.ModelPath)
 					s.updateFreeSpace(gpus)
+					if err := pending.ctx.Err(); err != nil {
+						slog.Debug("pending request cancelled or timed out before loading", "error", err)
+						break pendingLoop
+					}
 
 					if loadedCount == 0 {
 						// No models loaded. Load the model but prefer the best fit.
@@ -401,6 +451,9 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				case <-ctx.Done():
 					slog.Debug("shutting down scheduler pending loop")
 					return
+				case <-pending.ctx.Done():
+					slog.Debug("pending request cancelled while waiting for runner unload")
+					break pendingLoop
 				case <-s.unloadedCh:
 					slog.Debug("unload completed", "runner", runnerToExpire)
 					continue
@@ -543,11 +596,23 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
 // (if any). Returns whether the scheduler needs to evict a model to make this one fit.
 func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool {
+	if err := req.ctx.Err(); err != nil {
+		req.errCh <- err
+		return false
+	}
 	numParallel := max(int(envconfig.NumParallel()), 1)
 	completion := req.model.CheckCapabilities(model.CapabilityCompletion) == nil
 
 	// Embedding models should always be loaded with parallel=1
 	if !completion {
+		numParallel = 1
+	}
+	// Cortiq v0.8.19 does not report per-slot memory or device ownership
+	// through its public sidecar protocol. Until it does, run one sidecar slot
+	// per loaded CMF model rather than letting OLLAMA_NUM_PARALLEL silently
+	// oversubscribe memory that Ollama cannot account for.
+	if req.model.IsCMF() && numParallel != 1 {
+		slog.Warn("CMF runner currently uses one slot because Cortiq resource accounting is unavailable", "requested_num_parallel", numParallel)
 		numParallel = 1
 	}
 
@@ -571,7 +636,14 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 	if llama == nil {
 		var err error
-		if !req.model.IsMLX() {
+		if req.model.IsCMF() {
+			// Cortiq owns CMF placement and does not expose a stable VRAM
+			// accounting protocol to Ollama yet. Do not try to parse its opaque
+			// container or apply llama.cpp placement heuristics.
+			loadGpus = nil
+			req.contextShift = false
+			llama, err = s.newCMFServerFn(req.model.ModelPath, numParallel)
+		} else if !req.model.IsMLX() {
 			var loadErr error
 			f, loadErr = llm.LoadModel(req.model.ModelPath, 1024, req.model.ModelShardPaths...)
 			if loadErr != nil {
@@ -742,10 +814,14 @@ iGPUScan:
 	trainContext := modelTrainContext(f)
 	if effectiveNumCtx := llama.ContextLength(); req.model.ModelPath != "" && effectiveNumCtx > 0 {
 		req.opts.NumCtx = effectiveNumCtx
-		req.contextShift = resolveContextShift(req.shift, req.model)
+		if !req.model.IsCMF() {
+			req.contextShift = resolveContextShift(req.shift, req.model)
+		}
 	}
 	runnerName := req.model.Runner
-	if req.model.IsMLX() && runnerName == "" {
+	if req.model.IsCMF() && runnerName == "" {
+		runnerName = manifest.RunnerCMF
+	} else if req.model.IsMLX() && runnerName == "" {
 		runnerName = manifest.RunnerMLX
 	} else if llm.IsLlamaCPP(llama) {
 		// The loaded process is authoritative: a llama.cpp server may serve
@@ -1458,7 +1534,7 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	}
 
 	contextShift := req.contextShift
-	if req.model.ModelPath != "" {
+	if req.model.ModelPath != "" && !req.model.IsCMF() {
 		contextShift = resolveContextShift(req.shift, req.model)
 	}
 	if runner.contextShift != contextShift {
@@ -1469,7 +1545,7 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	defer cancel()
 	if !reflect.DeepEqual(runner.model.AdapterPaths, req.model.AdapterPaths) || // have the adapters changed?
 		!reflect.DeepEqual(runner.model.ProjectorPaths, req.model.ProjectorPaths) || // have the projectors changed?
-		(!runner.model.IsMLX() && !reflect.DeepEqual(optsExisting, optsNew)) || // have the runner options changed?
+		(!runner.model.IsMLX() && !runner.model.IsCMF() && !reflect.DeepEqual(optsExisting, optsNew)) || // have the runner options changed?
 		runner.llama.Ping(ctx) != nil {
 		return true
 	}

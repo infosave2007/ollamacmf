@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,23 +39,40 @@ import (
 )
 
 var (
-	errNoFilesProvided        = errors.New("no files provided to convert")
-	errAdaptersUnsupported    = errors.New("LoRA adapters are no longer supported")
-	errOnlyGGUFSupported      = errors.New("supplied file was not in GGUF format")
-	errUnknownType            = errors.New("unknown type")
-	errNeitherFromOrFiles     = errors.New("neither 'from' or 'files' was specified")
-	errFilePath               = errors.New("file path must be relative")
-	errRemoteDraftUnsupported = errors.New("DRAFT cannot be used with remote models")
-	errSafetensorsFrom        = errors.New("safetensors imports do not support FROM model overlays")
-	errInvalidSplitGGUF       = errors.New("invalid split GGUF")
-	errMixedModelTypes        = errors.New("mixed model file types")
-	errInvalidCreateInfo      = errors.New("invalid create info")
-	errTypicalPDeprecated     = errors.New("typical_p is deprecated and cannot be set as a model parameter; pass it as a request option instead")
+	errNoFilesProvided          = errors.New("no files provided to convert")
+	errAdaptersUnsupported      = errors.New("LoRA adapters are no longer supported")
+	errOnlyGGUFSupported        = errors.New("supplied file was not in GGUF format")
+	errUnknownType              = errors.New("unknown type")
+	errNeitherFromOrFiles       = errors.New("neither 'from' or 'files' was specified")
+	errFilePath                 = errors.New("file path must be relative")
+	errRemoteDraftUnsupported   = errors.New("DRAFT cannot be used with remote models")
+	errSafetensorsFrom          = errors.New("safetensors imports do not support FROM model overlays")
+	errInvalidSplitGGUF         = errors.New("invalid split GGUF")
+	errMixedModelTypes          = errors.New("mixed model file types")
+	errInvalidCreateInfo        = errors.New("invalid create info")
+	errInvalidCMF               = errors.New("invalid CMF file: expected a supported CMF envelope")
+	errCMFMultipleFiles         = errors.New("CMF imports require exactly one CMF model file")
+	errCMFDraftUnsupported      = errors.New("CMF imports do not support draft models")
+	errCMFQuantization          = errors.New("CMF imports do not support create-time quantization")
+	errCMFTemplateUnsupported   = errors.New("CMF imports do not support an Ollama TEMPLATE")
+	errCMFFormattingUnsupported = errors.New("CMF imports do not support an Ollama RENDERER or PARSER")
+	errCMFImagesUnsupported     = errors.New("CMF imports do not support image messages")
+	errCMFUnsupportedParameter  = errors.New("CMF imports support only temperature and num_predict parameters")
+	errCMFInvalidConfiguration  = errors.New("CMF model has invalid Modelfile configuration")
+	errTypicalPDeprecated       = errors.New("typical_p is deprecated and cannot be set as a model parameter; pass it as a request option instead")
 )
 
 const (
 	maxSafetensorsMetadataSize = 64 << 20
 	maxCreateFiles             = 1024
+	cmfMagic                   = "CMF\x01"
+	cmfEnvelopeLength          = 128
+	cmfVersion                 = 2
+	// CMF v2 feature bits Cortiq v0.8.19 understands. An import must not
+	// accept a container that its pinned runner would be required to reject.
+	cmfSupportedFeatures = 0x3fe7
+	cmfSkillFileFeature  = 1 << 6
+	cmfDecisionFeature   = 1 << 11
 )
 
 type manifestListRequestError struct {
@@ -134,7 +152,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 		// Mixed types and blobs the client never uploaded are request errors;
 		// anything else is the server failing to read its own blob store.
 		status := http.StatusInternalServerError
-		if errors.Is(err, errMixedModelTypes) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, manifest.ErrInvalidDigestFormat) {
+		if errors.Is(err, errMixedModelTypes) || errors.Is(err, errInvalidCMF) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, manifest.ErrInvalidDigestFormat) {
 			status = http.StatusBadRequest
 		}
 		c.AbortWithStatusJSON(status, gin.H{"error": err.Error()})
@@ -260,7 +278,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 		} else if r.Files != nil {
 			baseLayers, err = convertModelFromFiles(reqCtx, r.Files, fn)
 			if err != nil {
-				for _, badReq := range []error{errNoFilesProvided, errOnlyGGUFSupported, errUnknownType, errInvalidSplitGGUF, errMixedModelTypes, errAdaptersUnsupported} {
+				for _, badReq := range []error{errNoFilesProvided, errOnlyGGUFSupported, errUnknownType, errInvalidSplitGGUF, errMixedModelTypes, errAdaptersUnsupported, errInvalidCMF, errCMFMultipleFiles, errCMFDraftUnsupported, errCMFQuantization} {
 					if errors.Is(err, badReq) {
 						send(gin.H{"error": err.Error(), "status": http.StatusBadRequest})
 						return
@@ -276,6 +294,10 @@ func (s *Server) CreateHandler(c *gin.Context) {
 
 		if remote && len(r.DraftFiles) > 0 {
 			send(gin.H{"error": errRemoteDraftUnsupported.Error(), "status": http.StatusBadRequest})
+			return
+		}
+		if !remote && len(r.DraftFiles) > 0 && hasCMFLayer(baseLayers) {
+			send(gin.H{"error": errCMFDraftUnsupported.Error(), "status": http.StatusBadRequest})
 			return
 		}
 
@@ -307,7 +329,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 		config.AddCapabilities(r.Capabilities...)
 
 		if err := createModel(reqCtx, r, name, baseLayers, config, fn); err != nil {
-			if errors.Is(err, create.ErrBadTemplate) || errors.Is(err, create.ErrInvalidRequires) || errors.Is(err, create.ErrInvalidLicense) || errors.Is(err, errInvalidSplitGGUF) {
+			if errors.Is(err, create.ErrBadTemplate) || errors.Is(err, create.ErrInvalidRequires) || errors.Is(err, create.ErrInvalidLicense) || errors.Is(err, errInvalidSplitGGUF) || errors.Is(err, errCMFDraftUnsupported) || errors.Is(err, errCMFQuantization) || errors.Is(err, errCMFTemplateUnsupported) || errors.Is(err, errCMFFormattingUnsupported) || errors.Is(err, errCMFImagesUnsupported) || errors.Is(err, errCMFUnsupportedParameter) || errors.Is(err, errCMFInvalidConfiguration) {
 				send(gin.H{"error": err.Error(), "status": http.StatusBadRequest})
 				return
 			}
@@ -671,6 +693,26 @@ func convertModelFromFilesWithMediaType(ctx context.Context, files map[string]st
 	switch modelType {
 	case "safetensors":
 		return nil, errOnlyGGUFSupported
+	case manifest.FormatCMF:
+		if mediaType != "" {
+			return nil, errCMFDraftUnsupported
+		}
+		if len(files) != 1 {
+			return nil, errCMFMultipleFiles
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		for sourceName, digest := range files {
+			fn(api.ProgressResponse{Status: "validating CMF"})
+			layer, err := manifest.NewLayerFromLayer(digest, manifest.MediaTypeImageModel, sourceName)
+			if err != nil {
+				return nil, err
+			}
+			return []*modelLayer{{Layer: layer, CMF: true}}, nil
+		}
+		return nil, errCMFMultipleFiles
 	case "gguf":
 		if len(files) == 0 {
 			return nil, errNoFilesProvided
@@ -739,6 +781,24 @@ func validateCreateFilePath(filePath string) error {
 
 func validateCreateOptions(r api.CreateRequest, modelType string) error {
 	quantize := cmp.Or(r.Quantize, r.Quantization)
+	if modelType == manifest.FormatCMF {
+		if quantize != "" || r.DraftQuantize != "" {
+			return errCMFQuantization
+		}
+		if len(r.DraftFiles) > 0 {
+			return errCMFDraftUnsupported
+		}
+		if r.Template != "" {
+			return errCMFTemplateUnsupported
+		}
+		if r.Renderer != "" || r.Parser != "" {
+			return errCMFFormattingUnsupported
+		}
+		if cmfMessagesContainImages(r.Messages) {
+			return errCMFImagesUnsupported
+		}
+		return nil
+	}
 	if modelType == "gguf" || (modelType == "" && r.From != "") {
 		if quantize != "" {
 			return fmt.Errorf("create-time quantization is only supported for safetensors imports; quantize GGUF models with llama.cpp tools before importing")
@@ -794,6 +854,7 @@ func detectModelTypeFromFile(filePath, digest string) (string, error) {
 	if strings.HasSuffix(filePath, ".gguf") {
 		return "gguf", nil
 	}
+	isCMFFile := strings.EqualFold(filepath.Ext(filePath), ".cmf")
 
 	// Try to detect GGUF files even when the source name has no extension.
 	blobPath, err := manifest.BlobsPath(digest)
@@ -809,17 +870,174 @@ func detectModelTypeFromFile(filePath, digest string) (string, error) {
 	}
 	defer f.Close()
 
-	buf := make([]byte, 4)
-	if _, err := io.ReadFull(f, buf); err != nil {
+	magic := make([]byte, len(cmfMagic))
+	if _, err := io.ReadFull(f, magic); err != nil {
 		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			return "", fmt.Errorf("read %s: %w", filePath, err)
 		}
+		if isCMFFile {
+			return "", errInvalidCMF
+		}
 		return "", nil
 	}
-	if bytes.Equal(buf, []byte("GGUF")) || bytes.Equal(buf, []byte("FUGG")) {
+	if bytes.Equal(magic, []byte(cmfMagic)) {
+		envelope := make([]byte, cmfEnvelopeLength)
+		copy(envelope, magic)
+		if _, err := io.ReadFull(f, envelope[len(magic):]); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return "", fmt.Errorf("%w: file is shorter than the %d-byte envelope", errInvalidCMF, cmfEnvelopeLength)
+			}
+			return "", fmt.Errorf("read %s: %w", filePath, err)
+		}
+		info, err := f.Stat()
+		if err != nil {
+			return "", fmt.Errorf("stat %s: %w", filePath, err)
+		}
+		if err := validateCMFEnvelope(envelope, info.Size()); err != nil {
+			return "", err
+		}
+		return manifest.FormatCMF, nil
+	}
+	if isCMFFile {
+		return "", errInvalidCMF
+	}
+	if bytes.Equal(magic, []byte("GGUF")) || bytes.Equal(magic, []byte("FUGG")) {
 		return "gguf", nil
 	}
 	return "", nil
+}
+
+// validateCMFEnvelope performs the fixed-size, cheap checks that can be made
+// without interpreting the opaque CMF model. Cortiq remains the authority for
+// header JSON, tensor directories, and model semantics, but malformed or
+// incompatible container envelopes must not enter the manifest store first.
+func validateCMFEnvelope(envelope []byte, fileSize int64) error {
+	if len(envelope) < cmfEnvelopeLength || fileSize < cmfEnvelopeLength {
+		return fmt.Errorf("%w: file is shorter than the %d-byte envelope", errInvalidCMF, cmfEnvelopeLength)
+	}
+	if !bytes.Equal(envelope[:len(cmfMagic)], []byte(cmfMagic)) {
+		return errInvalidCMF
+	}
+	if version := binary.LittleEndian.Uint32(envelope[4:8]); version != cmfVersion {
+		return fmt.Errorf("%w: unsupported CMF version %d", errInvalidCMF, version)
+	}
+	if flags := binary.LittleEndian.Uint32(envelope[8:12]); flags != 0 {
+		return fmt.Errorf("%w: unsupported CMF envelope flags 0x%x", errInvalidCMF, flags)
+	}
+	required := binary.LittleEndian.Uint32(envelope[12:16])
+	if required&^cmfSupportedFeatures != 0 {
+		return fmt.Errorf("%w: unsupported required feature bits 0x%x", errInvalidCMF, required&^cmfSupportedFeatures)
+	}
+	if required&cmfSkillFileFeature != 0 {
+		return fmt.Errorf("%w: CMF skill files are not runnable models", errInvalidCMF)
+	}
+	if required&cmfDecisionFeature != 0 {
+		return fmt.Errorf("%w: CMF decision files are not supported by the generation runner", errInvalidCMF)
+	}
+
+	type section struct {
+		name     string
+		offset   int
+		required bool
+		aligned  bool
+	}
+	sections := []section{
+		{name: "header", offset: 0x10, required: true},
+		{name: "directory", offset: 0x20, required: true},
+		{name: "data", offset: 0x30, aligned: true},
+		{name: "masks", offset: 0x40},
+		{name: "vocabulary", offset: 0x50},
+		{name: "index", offset: 0x60},
+	}
+	length := uint64(fileSize)
+	for _, section := range sections {
+		offset := binary.LittleEndian.Uint64(envelope[section.offset : section.offset+8])
+		size := binary.LittleEndian.Uint64(envelope[section.offset+8 : section.offset+16])
+		if section.required && size == 0 {
+			return fmt.Errorf("%w: required %s section is empty", errInvalidCMF, section.name)
+		}
+		if size == 0 {
+			continue
+		}
+		if offset > length || size > length-offset {
+			return fmt.Errorf("%w: %s section is outside the file", errInvalidCMF, section.name)
+		}
+		if section.aligned && offset%4096 != 0 {
+			return fmt.Errorf("%w: data section is not 4096-byte aligned", errInvalidCMF)
+		}
+	}
+	return nil
+}
+
+func cmfMessagesContainImages(messages []api.Message) bool {
+	for _, message := range messages {
+		if len(message.Images) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// validateCMFBaseLayers applies the CMF create policy to the effective base
+// layers, whether they came from a local file import or FROM. Cortiq currently
+// accepts one opaque model file plus the safe Modelfile text layers below; a
+// projector, adapter, draft, extra model shard, or unknown layer must not be
+// carried into a manifest that the sidecar would silently ignore. New
+// parameters merge with inherited parameters, so an unsupported inherited key
+// cannot be overridden away. Messages are different: a non-empty request
+// replaces the inherited messages layer, so only the surviving inherited
+// messages need inspection.
+func validateCMFBaseLayers(layers []manifest.Layer, replacesMessages bool) error {
+	modelLayers := 0
+	for _, layer := range layers {
+		switch layer.MediaType {
+		case manifest.MediaTypeImageModel:
+			modelLayers++
+		case manifest.MediaTypeImageSystem, manifest.MediaTypeImageLicense:
+			// These are the only non-model Modelfile layers this bootstrap preserves.
+		case manifest.MediaTypeImageParams:
+			var parameters map[string]any
+			if err := decodeCMFBaseLayer(layer, &parameters); err != nil {
+				return fmt.Errorf("%w: parameters: %v", errCMFInvalidConfiguration, err)
+			}
+			if err := validateCMFParameters(parameters); err != nil {
+				return err
+			}
+		case manifest.MediaTypeImageMessages:
+			if replacesMessages {
+				continue
+			}
+			var messages []api.Message
+			if err := decodeCMFBaseLayer(layer, &messages); err != nil {
+				return fmt.Errorf("%w: messages: %v", errCMFInvalidConfiguration, err)
+			}
+			if cmfMessagesContainImages(messages) {
+				return errCMFImagesUnsupported
+			}
+		default:
+			return fmt.Errorf("%w: unsupported layer %q", errCMFInvalidConfiguration, layer.MediaType)
+		}
+	}
+	if modelLayers != 1 {
+		return fmt.Errorf("%w: expected exactly one model layer, found %d", errCMFInvalidConfiguration, modelLayers)
+	}
+	return nil
+}
+
+func decodeCMFBaseLayer(layer manifest.Layer, destination any) error {
+	f, err := layer.Open()
+	if err != nil {
+		return fmt.Errorf("open layer: %w", err)
+	}
+	decodeErr := json.NewDecoder(f).Decode(destination)
+	closeErr := f.Close()
+	if decodeErr != nil {
+		return fmt.Errorf("decode JSON: %w", decodeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close layer: %w", closeErr)
+	}
+	return nil
 }
 
 func createModel(ctx context.Context, r api.CreateRequest, name model.Name, baseLayers []*modelLayer, config *model.ConfigV2, fn func(resp api.ProgressResponse)) (err error) {
@@ -834,8 +1052,16 @@ func createModel(ctx context.Context, r api.CreateRequest, name model.Name, base
 	}
 
 	var layers []manifest.Layer
+	hasCMF := strings.EqualFold(config.ModelFormat, manifest.FormatCMF)
+	hasCMFTemplate := false
 	hasSplitGGUF := false
 	for _, layer := range baseLayers {
+		if layer.CMF {
+			hasCMF = true
+		}
+		if layer.MediaType == "application/vnd.ollama.image.prompt" || layer.MediaType == "application/vnd.ollama.image.template" {
+			hasCMFTemplate = true
+		}
 		if len(layer.splitLayers) > 0 {
 			hasSplitGGUF = true
 			layers = append(layers, layer.splitLayers...)
@@ -900,6 +1126,36 @@ func createModel(ctx context.Context, r api.CreateRequest, name model.Name, base
 			config.Requires = splitGGUFMinOllamaVersion
 		}
 	}
+	if hasCMF {
+		if config.Draft != nil {
+			return errCMFDraftUnsupported
+		}
+		if r.Template != "" {
+			return errCMFTemplateUnsupported
+		}
+		if hasCMFTemplate {
+			return errCMFTemplateUnsupported
+		}
+		if config.Renderer != "" || config.Parser != "" {
+			return errCMFFormattingUnsupported
+		}
+		if err := validateCMFParameters(config.GenerationDefaults); err != nil {
+			return err
+		}
+		if err := validateCMFBaseLayers(layers, len(r.Messages) > 0); err != nil {
+			return err
+		}
+		if cmfMessagesContainImages(r.Messages) {
+			return errCMFImagesUnsupported
+		}
+		if err := validateCMFParameters(r.Parameters); err != nil {
+			return err
+		}
+		// CMF model internals are opaque to this layer. Keep the manifest
+		// metadata truthful until the runner gains explicitly supported features.
+		config.ModelFormat = manifest.FormatCMF
+		config.Capabilities = []string{string(model.CapabilityCompletion)}
+	}
 
 	layers, err = create.ApplyModelfileLayers(layers, create.ModelfileLayerOptions{
 		Template:   r.Template,
@@ -942,6 +1198,31 @@ func createModel(ctx context.Context, r api.CreateRequest, name model.Name, base
 	}
 
 	return nil
+}
+
+func validateCMFParameters(parameters map[string]any) error {
+	var unsupported []string
+	for parameter := range parameters {
+		switch parameter {
+		case "temperature", "num_predict":
+		default:
+			unsupported = append(unsupported, parameter)
+		}
+	}
+	if len(unsupported) > 0 {
+		slices.Sort(unsupported)
+		return fmt.Errorf("%w: %s", errCMFUnsupportedParameter, strings.Join(unsupported, ", "))
+	}
+	return nil
+}
+
+func hasCMFLayer(layers []*modelLayer) bool {
+	for _, layer := range layers {
+		if layer != nil && layer.CMF {
+			return true
+		}
+	}
+	return false
 }
 
 func createManifestList(r api.CreateRequest, name model.Name, fn func(resp api.ProgressResponse)) error {
