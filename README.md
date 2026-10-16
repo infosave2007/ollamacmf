@@ -142,13 +142,32 @@ console.log(response.message.content);
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) project founded by Georgi Gerganov.
 
-## CMF engine bootstrap
+## Experimental CMF/Cortiq engine
 
-This fork contains an experimental local CMF/Cortiq sidecar adapter. It is not
-bundled in a public release or advertised as production support; its current
-trusted-single-user-host limitation, pinned runtime inputs, verification rules,
-and candidate-only release policy are documented in
-[the CMF engine contract](docs/cmf-engine.md).
+This fork adds an experimental local CMF/Cortiq sidecar adapter: Ollama stores
+and serves the model through its usual API while Cortiq executes the opaque
+`.cmf` blob. It is **not** bundled in an official or public `ollamacmf` release,
+is local-import only (not registry pull/push), and is safe only on a trusted,
+single-user host until the sidecar has an authenticated private protocol.
+
+### Local checkout quick start
+
+Build and run this checkout's binary, not an official `ollama` installer:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+go build -o "$HOME/.local/bin/ollamacmf" .
+export OLLAMA_BIN="$HOME/.local/bin/ollamacmf"
+export OLLAMA_CORTIQ_PATH=/absolute/path/to/verified/cortiq
+"$OLLAMA_BIN" serve
+```
+
+In another terminal (export `OLLAMA_BIN` there too), import a local CMF file
+with a Modelfile and use `"$OLLAMA_BIN" create ...` / `"$OLLAMA_BIN" run ...`.
+Verify the runtime archive using [the CMF engine contract](docs/cmf-engine.md)
+before setting `OLLAMA_CORTIQ_PATH`; that contract also covers import, API
+routing, compatibility, and release procedures. Do not expose or connect
+directly to the ephemeral Cortiq sidecar port.
 
 ## Documentation
 

@@ -175,6 +175,32 @@ To run tests, use `go test`:
 go test ./...
 ```
 
+## Native build CI in this fork
+
+Pull requests that change native-build inputs run a hosted **native CPU smoke**
+on Ubuntu and Windows. It builds the UI, builds the `ollama-local` CMake target,
+then verifies the generated runner payload and its installed layout.
+
+The complete Linux/Windows backend matrix (CPU, CUDA, ROCm, Vulkan, and MLX)
+is deliberately disabled for pull-request runs in this fork. It uses the
+upstream custom runner labels `linux` and `windows`, and must not wait forever
+for runners that a fork has not provisioned.
+
+After provisioning two dedicated, trusted self-hosted runners labeled `linux`
+and `windows` respectively, a maintainer can open **Actions → test → Run
+workflow** and set the **Run the self-hosted Linux/Windows native backend matrix**
+input to `true` for a reviewed, trusted ref. The normal pull-request workflow
+never enables that matrix.
+
+This source-level dispatch gate is not a self-hosted-runner security boundary:
+a pull request can modify its own workflow file. Before attaching a runner to a
+public repository, configure GitHub runner-group/repository access so untrusted
+pull-request workflows cannot reach it; if that isolation is unavailable, keep
+the runner out of the public fork and run the full matrix from a protected
+build repository instead. Never manually dispatch a self-hosted run for an
+unreviewed ref. These CI jobs validate builds only; they do not publish release
+artifacts.
+
 ## Library detection
 
 Ollama looks for native helper binaries and acceleration libraries in installed and local development layouts:

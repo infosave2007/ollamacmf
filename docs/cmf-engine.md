@@ -28,19 +28,34 @@ adapter as a local experimental integration, not production support.
 
 The sidecar is an implementation detail. Ollama invokes Cortiq on
 `127.0.0.1` through `GET /healthz`, `POST /v1/completions`, and
-`POST /v1/chat/completions`; their ports are ephemeral and must not be
-hard-coded. Clients should use the normal Ollama server API instead, beginning
-with `POST /api/generate` (and the experimental native `POST /api/chat` path
-for text messages), on the Ollama server endpoint.
+`POST /v1/chat/completions`; its port is ephemeral and must not be hard-coded.
+Clients use the normal Ollama server endpoint. For a CMF model, `POST
+/api/chat` and non-raw `POST /api/generate` are carried internally to Cortiq's
+native chat endpoint; only a raw `POST /api/generate` request is carried to
+Cortiq's completion endpoint. Neither public Ollama endpoint exposes the
+sidecar port.
 
 ## Experimental local use
 
 Use a build of **this fork**; there is no packaged CMF-enabled release yet.
-The server process must be able to execute a Cortiq binary matching the host
-and the CMF model must be a real CMF v2 file: the adapter checks its fixed
-128-byte envelope, version, required features, runnable model kind, and section
-bounds before it writes a manifest. Cortiq remains the authority for validating
-the opaque model header, tensor directory, and weights.
+Do not use an official Ollama installer for these commands. From the checkout
+root on Unix-like systems, build an explicitly named binary so it cannot be
+mistaken for an official package:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+go build -o "$HOME/.local/bin/ollamacmf" .
+export OLLAMA_BIN="$HOME/.local/bin/ollamacmf"
+"$OLLAMA_BIN" --version
+```
+
+Export `OLLAMA_BIN` in every terminal that follows. On Windows, build the same
+checkout into an explicitly named `.exe` and use its absolute path. The server
+process must be able to execute a Cortiq binary matching the host and the CMF
+model must be a real CMF v2 file: the adapter checks its fixed 128-byte
+envelope, version, required features, runnable model kind, and section bounds
+before it writes a manifest. Cortiq remains the authority for validating the
+opaque model header, tensor directory, and weights.
 
 1. Obtain the host's Cortiq archive named in [`../cmf.lock.json`](../cmf.lock.json),
    verify it as described in [Verification procedure](#verification-procedure),
@@ -78,12 +93,12 @@ the opaque model header, tensor directory, and weights.
    FROM /absolute/path/to/model.cmf
    EOF
 
-   # In one terminal, with OLLAMA_CORTIQ_PATH exported:
-   ollama serve
+   # In one terminal, with OLLAMA_BIN and OLLAMA_CORTIQ_PATH exported:
+   "$OLLAMA_BIN" serve
 
-   # In another terminal, using this fork's ollama client:
-   ollama create local-cmf -f /tmp/Modelfile.cmf
-   ollama run local-cmf
+   # In another terminal, after exporting OLLAMA_BIN to this fork's binary:
+   "$OLLAMA_BIN" create local-cmf -f /tmp/Modelfile.cmf
+   "$OLLAMA_BIN" run local-cmf
    ```
 
    The CMF import accepts exactly one CMF model file. It rejects a mixed or
@@ -97,10 +112,21 @@ the opaque model header, tensor directory, and weights.
    intentionally does not invent GGUF tensor metadata or emit an ignored Ollama
    template for an opaque CMF blob.
 
-3. Start with ordinary text generation. The adapter maps completion requests to
-   Cortiq's `/v1/completions` endpoint. Message-shaped requests use Cortiq's
-   native chat endpoint, so Ollama does not attempt to reproduce the CMF
-   tokenizer or chat template.
+3. Use ordinary Ollama text APIs. `"$OLLAMA_BIN" run`, `POST /api/chat`, and a
+   non-raw `POST /api/generate` request use Cortiq's native
+   `/v1/chat/completions` endpoint, so Ollama does not attempt to reproduce
+   the CMF tokenizer or chat template. Only `POST /api/generate` with
+   `"raw": true` uses Cortiq's non-streaming `/v1/completions` endpoint.
+   For example, after the server is ready:
+
+   ```sh
+   curl --fail --silent http://127.0.0.1:11434/api/chat \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"local-cmf","messages":[{"role":"user","content":"Hello"}],"stream":false,"options":{"num_predict":64}}'
+   ```
+
+   Replace the host and port if `OLLAMA_HOST` was set when starting the server.
+   The response is from the Ollama API; do not call the Cortiq loopback port.
 
 ### Current feature and resource limits
 
@@ -110,16 +136,19 @@ through its public HTTP protocol rather than silently ignoring them:
 - embeddings; tokenization, detokenization, and rendered chat templates;
 - images and other completion media;
 - constrained/structured output (`format`) and log probabilities;
-- tool use and positive thinking requests. Cortiq can report these capabilities
-  only after it has loaded a particular model/template, but Ollama must validate
-  capabilities before it starts a sidecar. The bootstrap therefore advertises
-  completion only rather than accepting controls that may be ignored;
-- non-default controls such as `top_k`, `min_p`, repetition/presence/frequency
-  penalties, `stop`, and `num_keep` (completion also rejects non-default
-  `top_p` and `seed`). A raw `/api/generate` completion rejects *any*
-  explicitly supplied `top_p` or `seed`, including an Ollama-default value,
-  because Cortiq's completion endpoint exposes neither control; native chat
-  requests use Cortiq's separate chat protocol instead;
+- tool use and positive thinking requests. Cortiq reports optional model/template
+  capabilities only after the sidecar starts, but Ollama must validate
+  capabilities before scheduling it. The bootstrap therefore advertises
+  completion only rather than accepting controls that could be ignored;
+- CMF model `PARAMETER` values other than `temperature` and `num_predict`.
+  For request options, only `temperature`, `num_predict`, `top_p`, and `seed`
+  are accepted; every other option key (including `top_k`, `min_p`,
+  repetition/presence/frequency penalties, `stop`, and `num_keep`) is rejected
+  before scheduling, even if its value matches an Ollama default (for example,
+  an explicit `top_k: 40`). Native chat forwards `top_p` and a non-negative
+  `seed`; raw `/api/generate` rejects either when it is explicitly supplied,
+  including an Ollama-default value, because Cortiq's completion endpoint
+  exposes neither control;
 - explicit `truncate` or `shift`. Cortiq owns context policy and does not
   expose Ollama-compatible token accounting, truncation, or context shifting,
   so the adapter rejects an explicit request rather than silently ignoring it.
