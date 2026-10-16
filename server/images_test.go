@@ -873,7 +873,6 @@ func TestPushModelRejectsCMFBeforeAnyUpload(t *testing.T) {
 		}
 		assertRejected(t, name, requests)
 	})
-
 }
 
 func TestModelCapabilities(t *testing.T) {

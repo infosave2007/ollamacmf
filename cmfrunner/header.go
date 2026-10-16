@@ -313,7 +313,7 @@ func countParameters(r io.ReaderAt, e *Envelope) uint64 {
 		return 0
 	}
 	var total uint64
-	for i := uint64(0); i < count; i++ {
+	for i := range count {
 		rec := raw[i*cmfDirectoryRecordLength : (i+1)*cmfDirectoryRecordLength]
 		ndim := int(rec[7])
 		if ndim == 0 || ndim > 6 {

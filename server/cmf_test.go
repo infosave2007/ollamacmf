@@ -519,7 +519,6 @@ func TestCreateHandlerRejectsUnsupportedInheritedCMFConfiguration(t *testing.T) 
 			}
 		})
 	}
-
 }
 
 func TestCMFRunnerAliasesAndChatMode(t *testing.T) {
@@ -928,5 +927,3 @@ func TestCMFOptionValidationReturnsBadRequest(t *testing.T) {
 		t.Fatalf("modelOptions() with ignored options error = %v, want nil", err)
 	}
 }
-
-func boolPointer(value bool) *bool { return &value }
