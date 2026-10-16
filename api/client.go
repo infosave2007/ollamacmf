@@ -324,6 +324,27 @@ func (c *Client) Pull(ctx context.Context, req *PullRequest, fn PullProgressFunc
 	})
 }
 
+// CMFStatus reports the Cortiq runtime the server uses for CMF models.
+func (c *Client) CMFStatus(ctx context.Context) (*CMFStatusResponse, error) {
+	var resp CMFStatusResponse
+	if err := c.do(ctx, http.MethodGet, "/api/cmf/status", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// CMFInstallRuntime asks the server to download and install the pinned
+// Cortiq runtime. fn is called with download progress.
+func (c *Client) CMFInstallRuntime(ctx context.Context, fn PullProgressFunc) error {
+	return c.stream(ctx, http.MethodPost, "/api/cmf/runtime/install", &CMFRuntimeInstallRequest{}, func(bts []byte) error {
+		var resp ProgressResponse
+		if err := json.Unmarshal(bts, &resp); err != nil {
+			return err
+		}
+		return fn(resp)
+	})
+}
+
 // PushProgressFunc is a function that [Client.Push] invokes when progress is
 // made.
 // It's similar to other progress function types like [PullProgressFunc].

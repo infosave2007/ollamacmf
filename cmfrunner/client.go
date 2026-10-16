@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,12 +29,15 @@ import (
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/ml"
+	"github.com/ollama/ollama/thinking"
 )
 
 const (
-	cortiqPathEnv          = "OLLAMA_CORTIQ_PATH"
-	cortiqAllowPathEnv     = "OLLAMA_CORTIQ_ALLOW_PATH"
-	cmfDefaultMaxTokens    = 256
+	// cmfDefaultMaxTokens bounds a response when the caller did not set
+	// num_predict. Cortiq's own default is 256 tokens, which truncates most
+	// chat answers; Ollama's convention is "until the model stops", so the
+	// adapter sends a generous explicit budget clamped to the model context.
+	cmfDefaultMaxTokens    = 32768
 	maxCMFJSONResponseSize = 8 << 20
 	healthProbeTimeout     = time.Second
 )
@@ -61,6 +63,7 @@ var (
 type Client struct {
 	binaryPath string
 	modelPath  string
+	info       *Info
 	port       int
 	memory     atomic.Uint64
 	parallel   int
@@ -80,33 +83,36 @@ type Client struct {
 	afterStart func(*exec.Cmd)
 }
 
-// NewClient prepares a Cortiq subprocess. The process is only started by Load.
-//
-// Cortiq owns the context limit embedded in the CMF file. This adapter has no
-// supported configuration or metadata path to enforce or report that limit, so
-// it intentionally does not accept an Ollama num_ctx value.
-func NewClient(modelPath string, parallel int) (*Client, error) {
-	binary, err := FindCortiq()
+// NewClient prepares a Cortiq subprocess for one CMF model. The process is
+// only started by Load. When no Cortiq runtime is present and automatic
+// installation is enabled, the pinned release is downloaded first.
+func NewClient(ctx context.Context, modelPath string, parallel int) (*Client, error) {
+	binary, err := EnsureRuntime(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	info, err := os.Stat(modelPath)
+	stat, err := os.Stat(modelPath)
 	if err != nil {
 		return nil, fmt.Errorf("stat CMF model %q: %w", modelPath, err)
 	}
-	if !info.Mode().IsRegular() {
+	if !stat.Mode().IsRegular() {
 		return nil, fmt.Errorf("CMF model %q is not a regular file", modelPath)
+	}
+	info, err := ReadInfoFile(modelPath)
+	if err != nil {
+		return nil, err
 	}
 
 	c := &Client{
 		binaryPath: binary,
 		modelPath:  modelPath,
+		info:       info,
 		parallel:   max(parallel, 1),
 		done:       make(chan struct{}),
 		client:     newHTTPClient(),
 	}
-	c.memory.Store(uint64(info.Size()))
+	c.memory.Store(uint64(stat.Size()))
 	return c, nil
 }
 
@@ -117,209 +123,6 @@ func newHTTPClient() *http.Client {
 			return errUnexpectedRedirect
 		},
 	}
-}
-
-// cortiqBinarySearch describes the independently testable executable lookup.
-type cortiqBinarySearch struct {
-	libOllamaPath string
-	executable    string
-	workingDir    string
-	goos          string
-	goarch        string
-	path          string
-}
-
-func defaultCortiqBinarySearch() cortiqBinarySearch {
-	executable, _ := os.Executable()
-	if executable != "" {
-		if eval, err := filepath.EvalSymlinks(executable); err == nil {
-			executable = eval
-		}
-	}
-	workingDir, _ := os.Getwd()
-	return cortiqBinarySearch{
-		libOllamaPath: ml.LibOllamaPath,
-		executable:    executable,
-		workingDir:    workingDir,
-		goos:          runtime.GOOS,
-		goarch:        runtime.GOARCH,
-		path:          os.Getenv("PATH"),
-	}
-}
-
-// FindCortiq locates a verified packaged Cortiq sidecar. An explicit
-// OLLAMA_CORTIQ_PATH is authoritative and never falls back silently. PATH and
-// workspace lookup are deliberately disabled by default: running an arbitrary
-// PATH entry from the Ollama service account is unsafe. They are available for
-// local development only when OLLAMA_CORTIQ_ALLOW_PATH=1 is set explicitly.
-func FindCortiq() (string, error) {
-	configured, configuredSet := os.LookupEnv(cortiqPathEnv)
-	return findCortiq(defaultCortiqBinarySearch(), configured, configuredSet, os.Getenv(cortiqAllowPathEnv) == "1")
-}
-
-func findCortiq(search cortiqBinarySearch, configured string, configuredSet, allowPath bool) (string, error) {
-	if configuredSet {
-		configured = strings.TrimSpace(configured)
-		if configured == "" {
-			return "", fmt.Errorf("%w: %s is empty", ErrRuntimeUnavailable, cortiqPathEnv)
-		}
-		if !filepath.IsAbs(configured) {
-			return "", fmt.Errorf("%w: %s must be an absolute path", ErrRuntimeUnavailable, cortiqPathEnv)
-		}
-		if !executableFile(configured) {
-			return "", fmt.Errorf("%w: %s=%q is not an executable file", ErrRuntimeUnavailable, cortiqPathEnv, configured)
-		}
-		return configured, nil
-	}
-
-	for _, candidate := range packagedCortiqBinaryCandidates(search) {
-		if executableFile(candidate) {
-			return candidate, nil
-		}
-	}
-	if allowPath {
-		for _, candidate := range developmentCortiqBinaryCandidates(search) {
-			if executableFile(candidate) {
-				return candidate, nil
-			}
-		}
-		if path, err := lookPathFrom(search.path, cortiqBinaryName(search.goos)); err == nil {
-			return path, nil
-		}
-	}
-
-	message := fmt.Sprintf("install Cortiq beside Ollama or set %s to an absolute executable path", cortiqPathEnv)
-	if !allowPath {
-		message += fmt.Sprintf("; set %s=1 only for local development PATH lookup", cortiqAllowPathEnv)
-	}
-	return "", fmt.Errorf("%w: %s", ErrRuntimeUnavailable, message)
-}
-
-func executableFile(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return false
-	}
-	// Windows does not preserve Unix executable bits for packaged binaries.
-	return runtime.GOOS == "windows" || info.Mode().Perm()&0o111 != 0
-}
-
-func lookPathFrom(path, file string) (string, error) {
-	for _, dir := range filepath.SplitList(path) {
-		candidate := filepath.Join(dir, file)
-		if executableFile(candidate) {
-			return candidate, nil
-		}
-	}
-	return "", exec.ErrNotFound
-}
-
-func packagedCortiqBinaryCandidates(search cortiqBinarySearch) []string {
-	goos := search.goos
-	if goos == "" {
-		goos = runtime.GOOS
-	}
-	name := cortiqBinaryName(goos)
-
-	seen := make(map[string]bool)
-	var candidates []string
-	add := func(dir string) {
-		if dir == "" {
-			return
-		}
-		candidate := filepath.Clean(filepath.Join(dir, name))
-		if !seen[candidate] {
-			seen[candidate] = true
-			candidates = append(candidates, candidate)
-		}
-	}
-	add(search.libOllamaPath)
-
-	addPackaged := func(base string) {
-		if base == "" {
-			return
-		}
-		switch goos {
-		case "darwin":
-			add(base)
-			add(filepath.Join(base, "lib", "ollama"))
-			add(filepath.Join(base, "..", "lib", "ollama"))
-		case "windows":
-			add(filepath.Join(base, "lib", "ollama"))
-			add(filepath.Join(base, "..", "lib", "ollama"))
-		default:
-			add(filepath.Join(base, "..", "lib", "ollama"))
-		}
-	}
-	if search.executable != "" {
-		addPackaged(filepath.Dir(search.executable))
-	}
-	return candidates
-}
-
-func developmentCortiqBinaryCandidates(search cortiqBinarySearch) []string {
-	goos := search.goos
-	if goos == "" {
-		goos = runtime.GOOS
-	}
-	goarch := search.goarch
-	if goarch == "" {
-		goarch = runtime.GOARCH
-	}
-	name := cortiqBinaryName(goos)
-
-	seen := make(map[string]bool)
-	var candidates []string
-	add := func(dir string) {
-		if dir == "" {
-			return
-		}
-		candidate := filepath.Clean(filepath.Join(dir, name))
-		if !seen[candidate] {
-			seen[candidate] = true
-			candidates = append(candidates, candidate)
-		}
-	}
-	addLocal := func(base string) {
-		if base == "" {
-			return
-		}
-		add(filepath.Join(base, "build", "lib", "ollama"))
-		add(filepath.Join(base, "dist", goos+"-"+goarch, "lib", "ollama"))
-		if goos+"_"+goarch != goos+"-"+goarch {
-			add(filepath.Join(base, "dist", goos+"_"+goarch, "lib", "ollama"))
-		}
-		if goos == "darwin" {
-			add(filepath.Join(base, "dist", "darwin"))
-		}
-	}
-	if search.executable != "" {
-		addLocal(filepath.Dir(search.executable))
-	}
-	addLocal(search.workingDir)
-	return candidates
-}
-
-// cortiqBinaryCandidates returns both production and explicit-development
-// locations for inspection tests. FindCortiq uses only the packaged subset
-// unless OLLAMA_CORTIQ_ALLOW_PATH=1 has been requested.
-func cortiqBinaryCandidates(search cortiqBinarySearch) []string {
-	seen := make(map[string]bool)
-	var candidates []string
-	for _, candidate := range append(packagedCortiqBinaryCandidates(search), developmentCortiqBinaryCandidates(search)...) {
-		if !seen[candidate] {
-			seen[candidate] = true
-			candidates = append(candidates, candidate)
-		}
-	}
-	return candidates
-}
-
-func cortiqBinaryName(goos string) string {
-	if goos == "windows" {
-		return "cortiq.exe"
-	}
-	return "cortiq"
 }
 
 // Load starts Cortiq on an ephemeral loopback port. Cortiq independently
@@ -359,7 +162,6 @@ func (c *Client) Load(ctx context.Context, _ ml.SystemInfo, _ []ml.DeviceInfo, _
 	cmd.Stderr = status
 
 	slog.Info("starting CMF runner subprocess", "model", c.modelPath, "port", port, "binary", c.binaryPath)
-	slog.Warn("CMF runner uses unauthenticated loopback HTTP; use only on a trusted single-user host until Cortiq provides an authenticated private runner protocol", "port", port)
 	if err := ctx.Err(); err != nil {
 		c.port = 0
 		return nil, err
@@ -565,12 +367,10 @@ func (c *Client) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 	if formatRequested(req.Format) {
 		return fmt.Errorf("%w: CMF constrained output", ErrUnsupported)
 	}
-	if err := validateSamplingOptions(req.Options, false); err != nil {
-		return err
-	}
+	logIgnoredOptions(req.Options, false)
 
 	payload := completionRequest{Model: filepath.Base(c.modelPath), Prompt: req.Prompt}
-	payload.applyOptions(req.Options)
+	payload.applyOptions(req.Options, c.ContextLength())
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("encode CMF completion request: %w", err)
@@ -615,9 +415,7 @@ func (c *Client) Chat(ctx context.Context, req llm.ChatRequest, fn func(llm.Chat
 	if req.Logprobs || req.TopLogprobs > 0 {
 		return fmt.Errorf("%w: CMF chat logprobs", ErrUnsupported)
 	}
-	if err := validateSamplingOptions(req.Options, true); err != nil {
-		return err
-	}
+	logIgnoredOptions(req.Options, true)
 	messages, err := cmfMessages(req.Messages)
 	if err != nil {
 		return err
@@ -629,7 +427,7 @@ func (c *Client) Chat(ctx context.Context, req llm.ChatRequest, fn func(llm.Chat
 		Tools:    req.Tools,
 		Stream:   true,
 	}
-	payload.applyOptions(req.Options)
+	payload.applyOptions(req.Options, c.ContextLength())
 	if req.Think != nil {
 		enabled := req.Think.Bool()
 		payload.EnableThinking = &enabled
@@ -649,10 +447,14 @@ func (c *Client) Chat(ctx context.Context, req llm.ChatRequest, fn func(llm.Chat
 	if resp.StatusCode >= http.StatusBadRequest {
 		return responseError(resp)
 	}
-	if !isEventStreamContentType(resp.Header.Get("Content-Type")) {
-		return c.handleChatJSON(resp.Body, fn)
+	var stop []string
+	if req.Options != nil {
+		stop = req.Options.Stop
 	}
-	return c.handleChatSSE(ctx, resp.Body, fn)
+	if !isEventStreamContentType(resp.Header.Get("Content-Type")) {
+		return c.handleChatJSON(resp.Body, stop, fn)
+	}
+	return c.handleChatSSE(ctx, resp.Body, stop, fn)
 }
 
 func isEventStreamContentType(contentType string) bool {
@@ -660,7 +462,7 @@ func isEventStreamContentType(contentType string) bool {
 	return err == nil && strings.EqualFold(mediaType, "text/event-stream")
 }
 
-func (c *Client) handleChatJSON(body io.Reader, fn func(llm.ChatResponse)) error {
+func (c *Client) handleChatJSON(body io.Reader, stop []string, fn func(llm.ChatResponse)) error {
 	var decoded chatResponse
 	if err := decodeCMFJSON(body, &decoded); err != nil {
 		return fmt.Errorf("decode CMF chat response: %w", err)
@@ -680,8 +482,18 @@ func (c *Client) handleChatJSON(body io.Reader, fn func(llm.ChatResponse)) error
 			return err
 		}
 	}
+	content := choice.Message.Content
+	reasoning := choice.Message.ReasoningContent
+	if reasoning == "" {
+		parser := newThinkParser()
+		thought, rest := parser.AddContent(content)
+		reasoning, content = thought, rest
+	}
+	if cut, ok := cutAtStop(content, stop); ok {
+		content = cut
+	}
 	fn(llm.ChatResponse{
-		Message:         api.Message{Role: nonEmpty(choice.Message.Role, "assistant"), Content: choice.Message.Content, Thinking: choice.Message.ReasoningContent, ToolCalls: toolCalls},
+		Message:         api.Message{Role: nonEmpty(choice.Message.Role, "assistant"), Content: content, Thinking: reasoning, ToolCalls: toolCalls},
 		Done:            true,
 		DoneReason:      reason,
 		PromptEvalCount: int(decoded.Usage.PromptTokens),
@@ -690,13 +502,28 @@ func (c *Client) handleChatJSON(body io.Reader, fn func(llm.ChatResponse)) error
 	return nil
 }
 
-func (c *Client) handleChatSSE(ctx context.Context, body io.Reader, fn func(llm.ChatResponse)) error {
+func (c *Client) handleChatSSE(ctx context.Context, body io.Reader, stop []string, fn func(llm.ChatResponse)) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 
 	var usage usage
 	var pendingTools []api.ToolCall
+	stopper := newStopFilter(stop)
+	thinker := newThinkParser()
 	finished := false
+	finish := func(reason llm.DoneReason) {
+		if finished {
+			return
+		}
+		finished = true
+		fn(llm.ChatResponse{
+			Message:         api.Message{Role: "assistant", ToolCalls: pendingTools},
+			Done:            true,
+			DoneReason:      reason,
+			PromptEvalCount: int(usage.PromptTokens),
+			EvalCount:       int(usage.CompletionTokens),
+		})
+	}
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -728,25 +555,46 @@ func (c *Client) handleChatSSE(ctx context.Context, body io.Reader, fn func(llm.
 				}
 				pendingTools = append(pendingTools, calls...)
 			}
-			if choice.Delta.Content != "" {
+			if choice.Delta.ReasoningContent != "" {
 				fn(llm.ChatResponse{Message: api.Message{
-					Role:    nonEmpty(choice.Delta.Role, "assistant"),
-					Content: choice.Delta.Content,
+					Role:     nonEmpty(choice.Delta.Role, "assistant"),
+					Thinking: choice.Delta.ReasoningContent,
 				}})
+			}
+			if choice.Delta.Content != "" {
+				thought, visible := thinker.AddContent(choice.Delta.Content)
+				if thought != "" {
+					fn(llm.ChatResponse{Message: api.Message{
+						Role:     nonEmpty(choice.Delta.Role, "assistant"),
+						Thinking: thought,
+					}})
+				}
+				if visible == "" {
+					continue
+				}
+				text, hitStop := stopper.push(visible)
+				if text != "" {
+					fn(llm.ChatResponse{Message: api.Message{
+						Role:    nonEmpty(choice.Delta.Role, "assistant"),
+						Content: text,
+					}})
+				}
+				if hitStop {
+					// A stop sequence ends the answer; the sidecar request is
+					// abandoned when the HTTP body is closed by the caller.
+					finish(llm.DoneReasonStop)
+					return nil
+				}
 			}
 			if choice.FinishReason != nil {
 				reason, err := doneReason(*choice.FinishReason)
 				if err != nil {
 					return err
 				}
-				fn(llm.ChatResponse{
-					Message:         api.Message{Role: "assistant", ToolCalls: pendingTools},
-					Done:            true,
-					DoneReason:      reason,
-					PromptEvalCount: int(usage.PromptTokens),
-					EvalCount:       int(usage.CompletionTokens),
-				})
-				finished = true
+				if tail := stopper.flush(); tail != "" {
+					fn(llm.ChatResponse{Message: api.Message{Role: "assistant", Content: tail}})
+				}
+				finish(reason)
 			}
 		}
 	}
@@ -757,6 +605,80 @@ func (c *Client) handleChatSSE(ctx context.Context, body io.Reader, fn func(llm.
 		return errors.New("CMF chat stream ended without a finish chunk")
 	}
 	return nil
+}
+
+// newThinkParser separates a leading <think>...</think> block, which Cortiq
+// streams inline for reasoning models, into Ollama's thinking field.
+func newThinkParser() *thinking.Parser {
+	return &thinking.Parser{OpeningTag: "<think>", ClosingTag: "</think>"}
+}
+
+// stopFilter cuts a streamed answer at the first Ollama stop sequence. Cortiq
+// has no stop parameter of its own, so the adapter holds back as many bytes
+// as the longest stop sequence could span across chunk boundaries.
+type stopFilter struct {
+	stops   []string
+	holdLen int
+	pending string
+}
+
+func newStopFilter(stops []string) *stopFilter {
+	f := &stopFilter{}
+	for _, s := range stops {
+		if s == "" {
+			continue
+		}
+		f.stops = append(f.stops, s)
+		f.holdLen = max(f.holdLen, len(s)-1)
+	}
+	return f
+}
+
+// push adds chunk and returns the text that is safe to emit now and whether
+// a stop sequence was reached.
+func (f *stopFilter) push(chunk string) (string, bool) {
+	if len(f.stops) == 0 {
+		return chunk, false
+	}
+	f.pending += chunk
+	if cut, ok := cutAtStop(f.pending, f.stops); ok {
+		f.pending = ""
+		return cut, true
+	}
+	if len(f.pending) <= f.holdLen {
+		return "", false
+	}
+	emit := f.pending[:len(f.pending)-f.holdLen]
+	// Do not split a multi-byte rune across emissions.
+	for len(emit) > 0 && emit[len(emit)-1] >= 0x80 && emit[len(emit)-1] < 0xC0 {
+		emit = emit[:len(emit)-1]
+	}
+	f.pending = f.pending[len(emit):]
+	return emit, false
+}
+
+// flush returns held-back text when the stream ends without a stop.
+func (f *stopFilter) flush() string {
+	out := f.pending
+	f.pending = ""
+	return out
+}
+
+// cutAtStop returns text truncated before the earliest stop sequence.
+func cutAtStop(text string, stops []string) (string, bool) {
+	cut := -1
+	for _, s := range stops {
+		if s == "" {
+			continue
+		}
+		if i := strings.Index(text, s); i >= 0 && (cut < 0 || i < cut) {
+			cut = i
+		}
+	}
+	if cut < 0 {
+		return text, false
+	}
+	return text[:cut], true
 }
 
 func decodeToolCalls(raw json.RawMessage) ([]api.ToolCall, error) {
@@ -853,10 +775,17 @@ func (c *Client) HasExited() bool {
 	}
 }
 
-// ContextLength is unknown: this adapter does not derive the effective CMF
-// context window. Returning zero avoids advertising an unapplied Ollama num_ctx
-// setting as an enforced limit.
-func (c *Client) ContextLength() int { return 0 }
+// ContextLength is the context window declared in the CMF header. Cortiq
+// owns the context policy; Ollama only reports the number.
+func (c *Client) ContextLength() int {
+	if c.info == nil {
+		return 0
+	}
+	return c.info.ContextLength()
+}
+
+// Info returns the metadata read from the CMF file.
+func (c *Client) Info() *Info { return c.info }
 
 func (c *Client) GetDeviceInfos(context.Context) []ml.DeviceInfo { return nil }
 
@@ -970,24 +899,23 @@ func nonEmpty(value, fallback string) string {
 	return fallback
 }
 
-// completionSamplingOptions is the deliberately small subset this bootstrap
-// forwards to Cortiq's /v1/completions endpoint.
+// completionSamplingOptions is what Cortiq's /v1/completions accepts.
 type completionSamplingOptions struct {
 	Temperature *float32 `json:"temperature,omitempty"`
 	MaxTokens   *int     `json:"max_tokens,omitempty"`
 }
 
-func (s *completionSamplingOptions) applyOptions(options *api.Options) {
-	count := cmfDefaultMaxTokens
+func (s *completionSamplingOptions) applyOptions(options *api.Options, contextLength int) {
+	numPredict := -1
 	if options != nil {
 		s.Temperature = &options.Temperature
-		count = cmfMaxTokens(options.NumPredict)
+		numPredict = options.NumPredict
 	}
+	count := cmfMaxTokens(numPredict, contextLength)
 	s.MaxTokens = &count
 }
 
-// chatSamplingOptions is the deliberately small subset this bootstrap forwards
-// to Cortiq's /v1/chat/completions endpoint.
+// chatSamplingOptions is what Cortiq's /v1/chat/completions accepts.
 type chatSamplingOptions struct {
 	Temperature *float32 `json:"temperature,omitempty"`
 	TopP        *float32 `json:"top_p,omitempty"`
@@ -995,85 +923,75 @@ type chatSamplingOptions struct {
 	MaxTokens   *int     `json:"max_tokens,omitempty"`
 }
 
-func (s *chatSamplingOptions) applyOptions(options *api.Options) {
-	count := cmfDefaultMaxTokens
+func (s *chatSamplingOptions) applyOptions(options *api.Options, contextLength int) {
+	numPredict := -1
 	if options != nil {
 		s.Temperature = &options.Temperature
-		s.TopP = &options.TopP
+		if options.TopP > 0 && options.TopP <= 1 {
+			s.TopP = &options.TopP
+		}
 		if options.Seed >= 0 {
 			seed := uint64(options.Seed)
 			s.Seed = &seed
 		}
-		count = cmfMaxTokens(options.NumPredict)
+		numPredict = options.NumPredict
 	}
+	count := cmfMaxTokens(numPredict, contextLength)
 	s.MaxTokens = &count
 }
 
-// This adapter has no unbounded max_tokens mapping. Map Ollama's default
-// num_predict=-1 explicitly to the adapter's documented 256-token fallback
-// rather than silently omitting the field and relying on server defaults that
-// could change in a later runtime.
-func cmfMaxTokens(numPredict int) int {
-	if numPredict == -1 {
-		return cmfDefaultMaxTokens
+// cmfMaxTokens maps Ollama's num_predict to Cortiq's max_tokens. Negative
+// values mean "no explicit limit" in Ollama; Cortiq always needs a number, so
+// the adapter sends a large budget bounded by the model's context window.
+func cmfMaxTokens(numPredict, contextLength int) int {
+	if numPredict >= 0 {
+		return numPredict
 	}
-	return numPredict
+	limit := cmfDefaultMaxTokens
+	if contextLength > 0 && contextLength < limit {
+		limit = contextLength
+	}
+	return limit
 }
 
-// validateSamplingOptions is the defense-in-depth check for normalized options
-// delivered to the LlamaServer. The public server separately validates raw CMF
-// option maps before scheduling, so it can reject unsupported explicit keys
-// even when their value equals an Ollama default. Cortiq itself may expose a
-// broader OpenAI-compatible sampling surface.
-func validateSamplingOptions(options *api.Options, chat bool) error {
+// logIgnoredOptions records request options Cortiq's HTTP API has no
+// equivalent for. They are ignored rather than rejected so ordinary clients
+// that always send them (num_ctx, top_k, repeat_penalty, ...) keep working.
+func logIgnoredOptions(options *api.Options, chat bool) {
 	if options == nil {
-		return nil
-	}
-	if options.NumPredict < -1 {
-		return fmt.Errorf("%w: CMF num_predict must be -1 or non-negative", ErrUnsupported)
-	}
-	if chat && options.Seed < -1 {
-		return fmt.Errorf("%w: CMF seed must be -1 or non-negative", ErrUnsupported)
+		return
 	}
 	defaults := api.DefaultOptions()
-	var unsupported []string
+	var ignored []string
 	if options.TopK != defaults.TopK {
-		unsupported = append(unsupported, "top_k")
+		ignored = append(ignored, "top_k")
 	}
 	if options.MinP != defaults.MinP {
-		unsupported = append(unsupported, "min_p")
-	}
-	if options.TypicalP != defaults.TypicalP {
-		unsupported = append(unsupported, "typical_p")
-	}
-	if options.RepeatLastN != defaults.RepeatLastN {
-		unsupported = append(unsupported, "repeat_last_n")
+		ignored = append(ignored, "min_p")
 	}
 	if options.RepeatPenalty != defaults.RepeatPenalty {
-		unsupported = append(unsupported, "repeat_penalty")
+		ignored = append(ignored, "repeat_penalty")
 	}
 	if options.PresencePenalty != defaults.PresencePenalty {
-		unsupported = append(unsupported, "presence_penalty")
+		ignored = append(ignored, "presence_penalty")
 	}
 	if options.FrequencyPenalty != defaults.FrequencyPenalty {
-		unsupported = append(unsupported, "frequency_penalty")
+		ignored = append(ignored, "frequency_penalty")
 	}
-	if options.NumKeep != defaults.NumKeep {
-		unsupported = append(unsupported, "num_keep")
+	if !chat {
+		if options.TopP != defaults.TopP {
+			ignored = append(ignored, "top_p")
+		}
+		if options.Seed != defaults.Seed {
+			ignored = append(ignored, "seed")
+		}
+		if len(options.Stop) > 0 {
+			ignored = append(ignored, "stop")
+		}
 	}
-	if len(options.Stop) > 0 {
-		unsupported = append(unsupported, "stop")
+	if len(ignored) > 0 {
+		slog.Debug("CMF runner ignores options Cortiq does not expose", "options", strings.Join(ignored, ", "))
 	}
-	if !chat && options.TopP != defaults.TopP {
-		unsupported = append(unsupported, "top_p")
-	}
-	if !chat && options.Seed != defaults.Seed {
-		unsupported = append(unsupported, "seed")
-	}
-	if len(unsupported) > 0 {
-		return fmt.Errorf("%w: CMF does not support non-default option(s): %s", ErrUnsupported, strings.Join(unsupported, ", "))
-	}
-	return nil
 }
 
 type completionRequest struct {
@@ -1134,9 +1052,10 @@ type cmfResponseMessage struct {
 type chatStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Role      string          `json:"role"`
-			Content   string          `json:"content"`
-			ToolCalls json.RawMessage `json:"tool_calls"`
+			Role             string          `json:"role"`
+			Content          string          `json:"content"`
+			ReasoningContent string          `json:"reasoning_content"`
+			ToolCalls        json.RawMessage `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`

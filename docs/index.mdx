@@ -3,66 +3,45 @@ title: ollamacmf documentation
 sidebarTitle: Welcome
 ---
 
-`ollamacmf` is an **experimental, source-only** Ollama fork for locally
-imported CMF v2 generative text models. It keeps Ollama's local API and model
-store, then runs the model through a separately configured Cortiq subprocess.
+`ollamacmf` is Ollama with native support for [CMF](https://github.com/infosave2007/cmf) models. Install it, start the server, and run a model from Hugging Face:
 
-It is independent of Ollama, Inc. and is not an official Ollama distribution.
-There is no CMF-enabled installer, Docker image, registry transport, or
-automatic binary release today.
+```sh
+curl -fsSL https://raw.githubusercontent.com/infosave2007/ollamacmf/main/install.sh | sh
+ollamacmf serve
+ollamacmf run hf.co/infosave/LFM2.5-cmf:lfm2.5-230m-q4tp
+```
 
-> [!WARNING]
-> The current Cortiq sidecar uses unauthenticated loopback HTTP and has a local
-> port bind race. Use it only on a trusted, single-user host. Read the
-> [security boundary](/cmf#security-boundary) before using a CMF model.
+The Cortiq runtime that executes CMF models is installed automatically. The Ollama API, the OpenAI-compatible API and the usual commands (`pull`, `run`, `list`, `show`, `rm`) all work as in Ollama.
 
 <CardGroup cols={2}>
-  <Card title="CMF/Cortiq quick start" icon="bolt" href="/cmf">
-    Build the fork, verify a build-target-matched runtime, import a local CMF model, and call the normal Ollama API.
+  <Card title="User guide" icon="book" href="/cmf">
+    Install, get models from Hugging Face or local files, configure the server, use the API, fix problems.
   </Card>
-  <Card title="Compatibility and limits" icon="circle-info" href="/cmf#compatibility-and-limits">
-    See the exact API subset, runtime/platform evidence, and intentional rejections.
+  <Card title="Model catalog" icon="list" href="/cmf-models">
+    Published CMF models with sizes and ready-to-paste pull commands.
   </Card>
-  <Card title="Engine contract" icon="diagram-project" href="/cmf-engine">
-    Read the maintainer-facing model, runner, lock, security, and packaging invariants.
+  <Card title="Maintainer notes" icon="gears" href="/cmf-engine">
+    How the adapter, the runtime lock and the release pipeline fit together.
   </Card>
-  <Card title="Runtime intake automation" icon="arrows-rotate" href="/cmf-release-automation">
-    See what the scheduled CMF release workflow verifies and why it does not publish artifacts.
+  <Card title="Runtime updates" icon="arrows-rotate" href="/cmf-release-automation">
+    How a new Cortiq release becomes the pinned runtime.
   </Card>
 </CardGroup>
 
-## What works today
+## Commands at a glance
 
-- Local `FROM /absolute/path/to/model.cmf` import for one runnable CMF v2 text
-  model.
-- `ollama run`, `POST /api/chat`, formatted `POST /api/generate`, and raw
-  `POST /api/generate` through the normal local Ollama endpoint.
-- A checked-in [canonical lock](https://github.com/infosave2007/ollamacmf/blob/main/cmf.lock.json)
-  for reviewed Cortiq runtime inputs and a matching tiny E2E fixture.
-- Linux `amd64` adapter E2E in CI; other locked desktop artifacts have narrower
-  evidence documented in the [platform table](/cmf#platform-and-runtime-scope).
+| Command | Purpose |
+| --- | --- |
+| `ollamacmf serve` | Start the server |
+| `ollamacmf run hf.co/infosave/<repo>:<file>` | Chat with a model, downloading it first if needed |
+| `ollamacmf pull hf.co/infosave/<repo>:<file>` | Download a model without starting a chat |
+| `ollamacmf run ./model.cmf` | Import a local file and chat with it |
+| `ollamacmf cmf import ./model.cmf --name NAME` | Import a local file under a name |
+| `ollamacmf cmf search [QUERY]` | List CMF models on Hugging Face |
+| `ollamacmf cmf status` | Show the runtime, the server and installed CMF models |
+| `ollamacmf cmf setup` | Install the Cortiq runtime ahead of time |
+| `ollamacmf list`, `show`, `ps`, `stop`, `cp`, `rm` | Manage models as in Ollama |
 
-## Important boundaries
+## Upstream Ollama documentation
 
-- CMF `pull` and `push` are intentionally unavailable.
-- The runtime is a separately configured Cortiq executable; it is not bundled
-  in the fork's source build. Operators select and checksum-verify its archive
-  against `cmf.lock.json` before use.
-- The current manifest advertises completion only. Embeddings, token APIs,
-  rendered templates, images, structured output, log probabilities, tool calls,
-  and positive thinking requests are not CMF features of this fork.
-- The scheduled workflow proposes a reviewed lock candidate PR. It does not
-  build, sign, publish, or update an `ollamacmf` release.
-
-## Inherited Ollama material
-
-This repository retains upstream-derived reference files for source history,
-but they are intentionally **not** in this fork's documentation navigation.
-They do not override the CMF guide's compatibility/security boundaries, and
-upstream installation, cloud, Docker, registry, capability, and integration
-instructions do not install or enable this adapter.
-
-Use the **CMF** navigation tab for fork-specific instructions. Use the
-[upstream Ollama documentation](https://docs.ollama.com) for general upstream
-behavior and [this repository's development guide](/development) for source
-build prerequisites.
+This fork tracks upstream Ollama. The inherited pages in this repository describe upstream behaviour (GGUF and safetensors models, cloud features, Docker images) and are kept for reference; the current upstream documentation lives at [docs.ollama.com](https://docs.ollama.com). Everything specific to CMF is on the pages linked above.

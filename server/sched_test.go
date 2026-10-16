@@ -161,7 +161,7 @@ func TestSchedLoadCMFUsesCMFRunnerWithoutGGUFPlacement(t *testing.T) {
 	cmfServer := &mockLlm{modelPath: "/does/not/need/to/be/gguf.cmf", vramByGPU: map[ml.DeviceID]uint64{}}
 	var gotModel string
 	var gotParallel int
-	s.newCMFServerFn = func(modelPath string, numParallel int) (llm.LlamaServer, error) {
+	s.newCMFServerFn = func(_ context.Context, modelPath string, numParallel int) (llm.LlamaServer, error) {
 		gotModel = modelPath
 		gotParallel = numParallel
 		return cmfServer, nil
@@ -1483,7 +1483,7 @@ func TestSchedCancelledCMFRequestDoesNotLoadAfterExclusiveEviction(t *testing.T)
 	s.loadedMu.Unlock()
 
 	started := make(chan struct{}, 1)
-	s.newCMFServerFn = func(string, int) (llm.LlamaServer, error) {
+	s.newCMFServerFn = func(context.Context, string, int) (llm.LlamaServer, error) {
 		started <- struct{}{}
 		return &mockLlm{}, nil
 	}

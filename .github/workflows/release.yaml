@@ -1,9 +1,10 @@
 name: release
 
+# Upstream Ollama's signed desktop/Docker release pipeline. It needs Ollama
+# Inc. signing secrets and self-hosted runners, so this fork does not run it
+# automatically. ollamacmf binaries are published by release-ollamacmf.yml.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 env:
   CGO_CFLAGS: '-O3'

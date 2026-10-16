@@ -3,7 +3,7 @@ name: Verify CMF candidate inputs
 on:
   pull_request:
     paths:
-      - 'cmf.lock.json'
+      - 'cmfrunner/cmf.lock.json'
       - '.github/workflows/cmf-release-sync.yml'
       - '.github/workflows/cmf-runner-smoke.yml'
       - '.github/scripts/verify_cmf_runtime_archive.py'
@@ -26,7 +26,7 @@ concurrency:
 
 env:
   CMF_REPOSITORY: infosave2007/cmf
-  CMF_LOCK_FILE: cmf.lock.json
+  CMF_LOCK_FILE: cmfrunner/cmf.lock.json
   CMF_MAX_ARCHIVE_BYTES: "536870912"
   CMF_MAX_CHECKSUM_BYTES: "4096"
 
@@ -104,10 +104,10 @@ jobs:
           while IFS= read -r path; do
             changed+=("$path")
           done < <(git diff-tree --no-commit-id --name-only -r "$CANDIDATE_SHA")
-          [[ ${#changed[@]} == 1 && "${changed[0]}" == 'cmf.lock.json' ]] || fail 'candidate must change only cmf.lock.json'
-          [[ "$(git cat-file -t "$CANDIDATE_SHA:cmf.lock.json")" == 'blob' ]] || fail 'candidate lock must be a regular Git blob'
+          [[ ${#changed[@]} == 1 && "${changed[0]}" == 'cmfrunner/cmf.lock.json' ]] || fail 'candidate must change only cmfrunner/cmf.lock.json'
+          [[ "$(git cat-file -t "$CANDIDATE_SHA:cmfrunner/cmf.lock.json")" == 'blob' ]] || fail 'candidate lock must be a regular Git blob'
           lock_file="${RUNNER_TEMP}/cmf-dispatch-candidate-lock.json"
-          git show "$CANDIDATE_SHA:cmf.lock.json" > "$lock_file"
+          git show "$CANDIDATE_SHA:cmfrunner/cmf.lock.json" > "$lock_file"
           [[ "$(wc -c < "$lock_file" | tr -d '[:space:]')" =~ ^[1-9][0-9]*$ ]] || fail 'candidate lock is empty'
           [[ "$(wc -c < "$lock_file" | tr -d '[:space:]')" -le 262144 ]] || fail 'candidate lock is too large'
 
@@ -504,7 +504,7 @@ jobs:
           command -v realpath >/dev/null || fail 'realpath is required'
           command -v python3 >/dev/null || fail 'python3 is required'
           candidate_root="$GITHUB_WORKSPACE/.cmf-candidate"
-          lock_file="$candidate_root/cmf.lock.json"
+          lock_file="$candidate_root/cmfrunner/cmf.lock.json"
           [[ ! -L "$lock_file" && -f "$lock_file" ]] || fail 'CMF candidate lock must be a regular file, not a symlink'
           script_root="$candidate_root"
           test_root="$candidate_root"

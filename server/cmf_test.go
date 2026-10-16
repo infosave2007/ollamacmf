@@ -33,7 +33,7 @@ func createCMFTestBlob(t *testing.T, payload string) string {
 func TestCMFRegistryPolicyErrorsAreBadRequests(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	for _, policyErr := range []error{errCMFRemotePull, errCMFRegistryPush} {
+	for _, policyErr := range []error{errCMFRegistryPush} {
 		t.Run(policyErr.Error(), func(t *testing.T) {
 			response := registryOperationError(policyErr)
 			if got, ok := response["status"].(int); !ok || got != http.StatusBadRequest {
@@ -134,20 +134,26 @@ func TestNonCMFRegistryPreflightErrorsKeepStreamingProgress(t *testing.T) {
 // cmfTestEnvelope is only a container-level fixture. It exercises the
 // adapter's import validation without pretending to be a runnable neural
 // network; Cortiq remains responsible for validating the opaque payload.
+const (
+	cmfTestMagic          = "CMF\x01"
+	cmfTestEnvelopeLength = 128
+	cmfTestVersion        = 2
+)
+
 func cmfTestEnvelope(payload string) []byte {
-	header := []byte(`{"fixture":` + strconv.Quote(payload) + `}`)
+	header := []byte(`{"format":"cmf","version":2,"arch":{"arch_name":"tiny-qwen","hidden_size":32,"num_layers":2,"vocab_size":128,"max_position_embeddings":128},"quant_type":"Q4_BLOCK","fixture":` + strconv.Quote(payload) + `}`)
 	directory := make([]byte, 16) // zero records, with a pool immediately after the fixed header
 	binary.LittleEndian.PutUint64(directory[8:16], uint64(len(directory)))
 
-	directoryOffset := cmfEnvelopeLength + len(header)
+	directoryOffset := cmfTestEnvelopeLength + len(header)
 	contents := make([]byte, directoryOffset+len(directory))
-	copy(contents, cmfMagic)
-	binary.LittleEndian.PutUint32(contents[4:8], cmfVersion)
-	binary.LittleEndian.PutUint64(contents[0x10:0x18], cmfEnvelopeLength)
+	copy(contents, cmfTestMagic)
+	binary.LittleEndian.PutUint32(contents[4:8], cmfTestVersion)
+	binary.LittleEndian.PutUint64(contents[0x10:0x18], cmfTestEnvelopeLength)
 	binary.LittleEndian.PutUint64(contents[0x18:0x20], uint64(len(header)))
 	binary.LittleEndian.PutUint64(contents[0x20:0x28], uint64(directoryOffset))
 	binary.LittleEndian.PutUint64(contents[0x28:0x30], uint64(len(directory)))
-	copy(contents[cmfEnvelopeLength:], header)
+	copy(contents[cmfTestEnvelopeLength:], header)
 	copy(contents[directoryOffset:], directory)
 	return contents
 }
@@ -157,9 +163,9 @@ func TestDetectCMFModelType(t *testing.T) {
 
 	valid := createCMFTestBlob(t, "opaque model")
 	invalid := createTestBlob(t, []byte("not a CMF model"))
-	truncated := createTestBlob(t, []byte(cmfMagic))
+	truncated := createTestBlob(t, []byte(cmfTestMagic))
 	unsupportedVersion := cmfTestEnvelope("unsupported version")
-	binary.LittleEndian.PutUint32(unsupportedVersion[4:8], cmfVersion+1)
+	binary.LittleEndian.PutUint32(unsupportedVersion[4:8], cmfTestVersion+1)
 	unsupportedVersionDigest := createTestBlob(t, unsupportedVersion)
 	unsupportedFeature := cmfTestEnvelope("unsupported feature")
 	binary.LittleEndian.PutUint32(unsupportedFeature[12:16], 1<<3) // DELTA_MASKS is not supported by the pinned Cortiq runtime.
@@ -387,14 +393,6 @@ func TestCreateHandlerRejectsUnsupportedCMFLayouts(t *testing.T) {
 			want: errCMFFormattingUnsupported.Error(),
 		},
 		{
-			name: "CMF unsupported parameter",
-			req: api.CreateRequest{
-				Files:      map[string]string{"model.cmf": digest},
-				Parameters: map[string]any{"stop": "END"},
-			},
-			want: errCMFUnsupportedParameter.Error(),
-		},
-		{
 			name: "CMF image message",
 			req: api.CreateRequest{
 				Files:    map[string]string{"model.cmf": digest},
@@ -477,13 +475,6 @@ func TestCreateHandlerRejectsUnsupportedInheritedCMFConfiguration(t *testing.T) 
 		want        error
 	}{
 		{
-			name: "parameters",
-			extraLayers: func(t *testing.T) []manifest.Layer {
-				return []manifest.Layer{newTextLayer(t, `{"top_k":1}`, manifest.MediaTypeImageParams)}
-			},
-			want: errCMFUnsupportedParameter,
-		},
-		{
 			name: "image messages",
 			extraLayers: func(t *testing.T) []manifest.Layer {
 				return []manifest.Layer{newTextLayer(t, `[{"role":"user","images":["AQ=="]}]`, manifest.MediaTypeImageMessages)}
@@ -529,30 +520,6 @@ func TestCreateHandlerRejectsUnsupportedInheritedCMFConfiguration(t *testing.T) 
 		})
 	}
 
-	t.Run("generation defaults", func(t *testing.T) {
-		t.Setenv("OLLAMA_MODELS", t.TempDir())
-		base := "cmf-inherited-generation-defaults"
-		destination := base + "-derived"
-		writeShowManifestVariant(t, base, manifest.RunnerCMF, manifest.FormatCMF,
-			model.ConfigV2{
-				ModelFormat:        manifest.FormatCMF,
-				Capabilities:       []string{string(model.CapabilityCompletion)},
-				GenerationDefaults: model.GenerationDefaults{"top_k": 1},
-			}, nil, newCMFModelLayer(t))
-
-		var s Server
-		w := createRequest(t, s.CreateHandler, api.CreateRequest{
-			Model:  destination,
-			From:   base,
-			Stream: &stream,
-		})
-		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), errCMFUnsupportedParameter.Error()) {
-			t.Fatalf("derived CMF generation defaults status/body = %d/%s, want 400 containing %q", w.Code, w.Body.String(), errCMFUnsupportedParameter)
-		}
-		if _, err := manifest.ReadManifestData(model.ParseName(destination)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("derived CMF manifest was written despite rejected generation defaults: %v", err)
-		}
-	})
 }
 
 func TestCMFRunnerAliasesAndChatMode(t *testing.T) {
@@ -775,12 +742,6 @@ func TestCMFGenerateRejectsUnsupportedInputsBeforeScheduling(t *testing.T) {
 		{name: "format", req: api.GenerateRequest{Model: "cmf-reject-generate", Prompt: "hello", Format: json.RawMessage(`"json"`), Stream: &stream}},
 		{name: "logprobs", req: api.GenerateRequest{Model: "cmf-reject-generate", Prompt: "hello", Logprobs: true, Stream: &stream}},
 		{name: "top logprobs", req: api.GenerateRequest{Model: "cmf-reject-generate", Prompt: "hello", TopLogprobs: 1, Stream: &stream}},
-		{name: "truncate", req: api.GenerateRequest{Model: "cmf-reject-generate", Prompt: "hello", Truncate: boolPointer(true), Stream: &stream}},
-		{name: "shift", req: api.GenerateRequest{Model: "cmf-reject-generate", Prompt: "hello", Shift: boolPointer(false), Stream: &stream}},
-		{name: "raw top p", req: api.GenerateRequest{Model: "cmf-reject-generate", Prompt: "hello", Raw: true, Options: map[string]any{"top_p": 0.5}, Stream: &stream}},
-		{name: "raw seed", req: api.GenerateRequest{Model: "cmf-reject-generate", Prompt: "hello", Raw: true, Options: map[string]any{"seed": 42}, Stream: &stream}},
-		{name: "raw explicit default top p", req: api.GenerateRequest{Model: "cmf-reject-generate", Prompt: "hello", Raw: true, Options: map[string]any{"top_p": api.DefaultOptions().TopP}, Stream: &stream}},
-		{name: "raw explicit default seed", req: api.GenerateRequest{Model: "cmf-reject-generate", Prompt: "hello", Raw: true, Options: map[string]any{"seed": api.DefaultOptions().Seed}, Stream: &stream}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -938,8 +899,6 @@ func TestCMFChatRejectsUnsupportedOutputsBeforeScheduling(t *testing.T) {
 		{name: "format", req: api.ChatRequest{Model: "cmf-reject-chat", Messages: []api.Message{{Role: "user", Content: "hello"}}, Format: json.RawMessage(`"json"`), Stream: &stream}},
 		{name: "logprobs", req: api.ChatRequest{Model: "cmf-reject-chat", Messages: []api.Message{{Role: "user", Content: "hello"}}, Logprobs: true, Stream: &stream}},
 		{name: "top logprobs", req: api.ChatRequest{Model: "cmf-reject-chat", Messages: []api.Message{{Role: "user", Content: "hello"}}, TopLogprobs: 1, Stream: &stream}},
-		{name: "truncate", req: api.ChatRequest{Model: "cmf-reject-chat", Messages: []api.Message{{Role: "user", Content: "hello"}}, Truncate: boolPointer(false), Stream: &stream}},
-		{name: "shift", req: api.ChatRequest{Model: "cmf-reject-chat", Messages: []api.Message{{Role: "user", Content: "hello"}}, Shift: boolPointer(true), Stream: &stream}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -957,27 +916,16 @@ func TestCMFChatRejectsUnsupportedOutputsBeforeScheduling(t *testing.T) {
 func TestCMFOptionValidationReturnsBadRequest(t *testing.T) {
 	m := &Model{Config: model.ConfigV2{ModelFormat: manifest.FormatCMF}}
 	var s Server
-	for _, options := range []map[string]any{
-		{"num_gpu": 0},
-		{"temperature": "not-a-number"},
-	} {
-		_, err := s.modelOptions(m, options)
-		var status api.StatusError
-		if !errors.As(err, &status) || status.StatusCode != http.StatusBadRequest {
-			t.Fatalf("modelOptions(%v) error = %v, want HTTP 400 StatusError", options, err)
-		}
+	_, err := s.modelOptions(m, map[string]any{"temperature": "not-a-number"})
+	var status api.StatusError
+	if !errors.As(err, &status) || status.StatusCode != http.StatusBadRequest {
+		t.Fatalf("modelOptions() error = %v, want HTTP 400 StatusError", err)
 	}
 
-	for _, optionMap := range []map[string]any{
-		{"top_p": api.DefaultOptions().TopP},
-		{"seed": api.DefaultOptions().Seed},
-	} {
-		m.GenerationDefaults = optionMap
-		err := validateCMFRawCompletionOptionMaps(m, nil)
-		var status api.StatusError
-		if !errors.As(err, &status) || status.StatusCode != http.StatusBadRequest {
-			t.Fatalf("raw completion options %v error = %v, want HTTP 400 StatusError", optionMap, err)
-		}
+	// Options Cortiq has no equivalent for are accepted and ignored, so
+	// ordinary clients that always send them keep working.
+	if _, err := s.modelOptions(m, map[string]any{"num_gpu": float64(0), "top_k": float64(40), "num_ctx": float64(8192)}); err != nil {
+		t.Fatalf("modelOptions() with ignored options error = %v, want nil", err)
 	}
 }
 

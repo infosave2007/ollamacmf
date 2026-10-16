@@ -78,7 +78,7 @@ type Scheduler struct {
 
 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
-	newCMFServerFn  func(model string, numParallel int) (llm.LlamaServer, error)
+	newCMFServerFn  func(ctx context.Context, model string, numParallel int) (llm.LlamaServer, error)
 	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
 	getSystemInfoFn func() ml.SystemInfo
 	waitForRecovery time.Duration
@@ -139,8 +139,8 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		unloadedCh:    make(chan any, maxQueue),
 		loaded:        make(map[string]*runnerRef),
 		newServerFn:   llm.NewLlamaServer,
-		newCMFServerFn: func(model string, numParallel int) (llm.LlamaServer, error) {
-			return cmfrunner.NewClient(model, numParallel)
+		newCMFServerFn: func(ctx context.Context, model string, numParallel int) (llm.LlamaServer, error) {
+			return cmfrunner.NewClient(ctx, model, numParallel)
 		},
 		getGpuFn:        discover.GPUDevices,
 		getSystemInfoFn: discover.GetSystemInfo,
@@ -642,7 +642,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// container or apply llama.cpp placement heuristics.
 			loadGpus = nil
 			req.contextShift = false
-			llama, err = s.newCMFServerFn(req.model.ModelPath, numParallel)
+			llama, err = s.newCMFServerFn(req.ctx, req.model.ModelPath, numParallel)
 		} else if !req.model.IsMLX() {
 			var loadErr error
 			f, loadErr = llm.LoadModel(req.model.ModelPath, 1024, req.model.ModelShardPaths...)

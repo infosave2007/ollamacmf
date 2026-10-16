@@ -1,344 +1,280 @@
+<div align="center">
+
 # ollamacmf
 
-> **Experimental, source-only Ollama fork that runs locally imported CMF v2 text
-> models through a Cortiq sidecar.**
+**Ollama with native support for CMF models.**
 
-[CMF quick start](docs/cmf.md) · [compatibility and safety](docs/cmf.md#compatibility-and-limits) · [runtime intake](docs/cmf-release-automation.md) · [development](docs/development.md) · [upstream Ollama](https://github.com/ollama/ollama)
+[![Release](https://img.shields.io/github/v/release/infosave2007/ollamacmf?label=release)](https://github.com/infosave2007/ollamacmf/releases/latest)
+[![Build](https://github.com/infosave2007/ollamacmf/actions/workflows/release-ollamacmf.yml/badge.svg)](https://github.com/infosave2007/ollamacmf/actions/workflows/release-ollamacmf.yml)
+[![CMF models](https://img.shields.io/badge/CMF%20models-Hugging%20Face-ffd21e?logo=huggingface)](https://huggingface.co/infosave)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`ollamacmf` is an independent fork of [Ollama](https://github.com/ollama/ollama).
-It is not affiliated with Ollama, Inc.  The fork keeps Ollama's local model
-store and public API, then starts [Cortiq](https://github.com/infosave2007/cmf)
-as a local subprocess for a runnable CMF model.
+[Install](#install) · [Quick start](#quick-start) · [Models](#models) · [Use from apps](#use-it-from-your-apps) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [Русский](README.ru.md)
 
-> [!WARNING]
-> This is a bootstrap integration for a **trusted, single-user host**. Cortiq's
-> sidecar uses unauthenticated loopback HTTP, and the current launch sequence
-> has a local port bind race. Do not expose the sidecar, use it on a multi-user
-> or hostile-workload host, or treat loopback as an authorization boundary.
-> Read the [security boundary](docs/cmf.md#security-boundary) before importing a
-> model.
+</div>
 
-## Status at a glance
+`ollamacmf` is a fork of [Ollama](https://github.com/ollama/ollama) that runs [CMF](https://github.com/infosave2007/cmf) models, the compact single-file format produced by Cortiq. Everything you already know from Ollama works the same way: `pull`, `run`, `list`, `rm`, the REST API, the OpenAI-compatible API, and every app that talks to Ollama.
 
-| Area | Current status |
-| --- | --- |
-| CMF model path | Local `FROM /absolute/path/model.cmf` import for runnable generative CMF v2 text models |
-| Runtime | An explicitly configured, build-target-matched Cortiq executable; **not** embedded or bundled |
-| Distribution | Source checkout only; no CMF-enabled official binaries, installer, or Docker image |
-| Registry | CMF `ollama pull` and `ollama push` are intentionally rejected |
-| Automation | A scheduled/repository-dispatch workflow proposes a verified **candidate lock PR**; it does not package, sign, or publish a release |
-| Platform evidence | Linux `amd64` adapter E2E runs in CI; other locked desktop artifacts are reviewed inputs, not a production-support promise |
-
-The [canonical lock](cmf.lock.json) records the exact Cortiq release assets
-reviewed by this revision. It is an integrity record, not a cryptographic
-provenance attestation: the currently pinned upstream tag is unsigned and its
-GitHub release was not immutable when checked. Never substitute `latest`, a
-random `PATH` binary, or an artifact for a different OS/architecture.
-
-## What the fork adds
-
-```text
-Ollama CLI / local Ollama API
-             |
-             v
-      ollamacmf server
-  (model store + scheduling)
-             |
-             v
-  cmfrunner -> Cortiq subprocess -> local .cmf model
-      127.0.0.1:<ephemeral port>
+```sh
+ollamacmf run hf.co/infosave/Granite-4.2-cmf:granite-4.2-3b-q4tp
 ```
 
-Clients continue to call the normal Ollama endpoint. The ephemeral Cortiq port
-is an implementation detail and must not be used by clients:
+The Cortiq runtime that executes CMF models is downloaded, verified and installed automatically on first use. There is nothing to configure.
 
-- `ollama run`, `POST /api/chat`, and formatted `POST /api/generate` use
-  Cortiq's chat-completions endpoint so Cortiq owns the model tokenizer and
-  chat template.
-- `POST /api/generate` with `"raw": true` uses Cortiq's completion endpoint.
-- Ollama stores the CMF blob as an opaque model layer. It performs inexpensive
-  CMF-envelope checks at import time; Cortiq remains responsible for the full
-  model and weights validation.
+## Install
 
-## Verified local smoke test (macOS/Linux)
+**macOS and Linux**
 
-This is deliberately a source-build flow. **Do not use an official Ollama
-installer or image for these steps**: those distributions do not contain this
-fork's CMF adapter.
+```sh
+curl -fsSL https://raw.githubusercontent.com/infosave2007/ollamacmf/main/install.sh | sh
+```
 
-### 1. Build this checkout
+**Windows** (PowerShell)
 
-Prerequisites: Git, Go, `curl`, `jq`, Python 3, and either `shasum` or
-`sha256sum`. Build for the same OS/architecture as the Cortiq runtime. The
-selector below uses the Go build target, not `uname`, so it also remains correct
-when Go runs under an emulator.
+```powershell
+irm https://raw.githubusercontent.com/infosave2007/ollamacmf/main/install.ps1 | iex
+```
+
+**Manual download.** Grab the archive for your platform from the [latest release](https://github.com/infosave2007/ollamacmf/releases/latest), unpack it anywhere and run `ollamacmf` from there. Each archive contains the `ollamacmf` binary and the matching Cortiq runtime.
+
+**From source** (Go 1.26 or newer, a C compiler)
 
 ```sh
 git clone https://github.com/infosave2007/ollamacmf.git
 cd ollamacmf
-go build -o ./ollamacmf .
-export OLLAMA_BIN="$(pwd)/ollamacmf"
-"$OLLAMA_BIN" --version
+go build -o ollamacmf .
 ```
 
-`go build` is sufficient for the CMF smoke flow below. Build the full native
-Ollama payload with the [development guide](docs/development.md) when working
-on the other Ollama engines.
+`ollamacmf` can run next to a regular Ollama installation. It uses the same default port (`11434`), so stop one before starting the other, or give `ollamacmf` its own port with `OLLAMA_HOST=127.0.0.1:11435`.
 
-### 2. Download the *locked* runtime, verify it, then extract it
+## Quick start
 
-The POSIX-`sh` snippet selects exactly one artifact for the local Go build
-target from this checkout's `cmf.lock.json`; it fails rather than substituting
-a target. Before extraction, it checks each downloaded file's size and SHA-256
-**directly against the lock**, checks that the pinned checksum sidecar names the
-same archive hash, and uses the tracked safe archive verifier. It downloads but
-never executes the runtime during setup.
+Start the server in one terminal:
 
 ```sh
-set -eu
-
-fail() {
-  printf '%s\n' "error: $*" >&2
-  exit 1
-}
-
-sha256_file() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk 'NR == 1 { print $1 }'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk 'NR == 1 { print $1 }'
-  else
-    fail 'need shasum or sha256sum'
-  fi
-}
-
-file_size() {
-  wc -c < "$1" | tr -d '[:space:]'
-}
-
-require_sha256() {
-  value=$1
-  label=$2
-  case "$value" in
-    ''|*[!0123456789abcdef]*) fail "$label is not a lowercase SHA-256" ;;
-  esac
-  [ "${#value}" -eq 64 ] || fail "$label is not a 64-character SHA-256"
-}
-
-require_positive_decimal() {
-  value=$1
-  label=$2
-  case "$value" in
-    ''|*[!0123456789]*) fail "$label is not a positive decimal byte count" ;;
-  esac
-  [ "$value" -gt 0 ] 2>/dev/null || fail "$label is not a positive decimal byte count"
-}
-
-require_basename() {
-  value=$1
-  label=$2
-  case "$value" in
-    ''|.|..|*/*|*\\*|*[!A-Za-z0-9._-]*) fail "$label is not a safe file name" ;;
-  esac
-}
-
-repo_root=$(pwd -P)
-[ -f "$repo_root/cmf.lock.json" ] || fail 'run this from the checkout root'
-verifier="$repo_root/.github/scripts/verify_cmf_runtime_archive.py"
-[ -f "$verifier" ] || fail 'CMF archive verifier is missing'
-command -v python3 >/dev/null 2>&1 || fail 'python3 is required for safe archive extraction'
-
-case "$(go env GOOS)" in
-  linux|darwin) cmf_os=$(go env GOOS) ;;
-  *) fail 'use the Windows guide or an explicitly reviewed build target' ;;
-esac
-case "$(go env GOARCH)" in
-  amd64|arm64) cmf_arch=$(go env GOARCH) ;;
-  *) fail "unsupported Go build architecture: $(go env GOARCH)" ;;
-esac
-cmf_platform="$cmf_os/$cmf_arch"
-
-asset=$(jq -ce --arg platform "$cmf_platform" '
-  [.artifacts[] | select(.platform == $platform)] as $matches
-  | if ($matches | length) == 1 then $matches[0]
-    else error("expected exactly one reviewed artifact for \($platform); found \($matches | length)")
-    end
-' "$repo_root/cmf.lock.json") || fail "could not select a unique reviewed runtime for $cmf_platform"
-
-asset_field() {
-  printf '%s\n' "$asset" | jq -er "$1"
-}
-
-archive_url=$(asset_field '.archive.url') || fail 'lock has no archive URL'
-archive_name=$(asset_field '.archive.name') || fail 'lock has no archive name'
-archive_size=$(asset_field '.archive.sizeBytes') || fail 'lock has no archive byte count'
-archive_sha256=$(asset_field '.archive.sha256') || fail 'lock has no archive SHA-256'
-archive_format=$(asset_field '.archive.format') || fail 'lock has no archive format'
-archive_entry=$(asset_field '.archive.entries | if type == "array" and length == 1 then .[0] else error("expected one archive entry") end') || fail 'lock has invalid archive entries'
-checksum_url=$(asset_field '.checksum.url') || fail 'lock has no checksum URL'
-checksum_name=$(asset_field '.checksum.name') || fail 'lock has no checksum name'
-checksum_size=$(asset_field '.checksum.sizeBytes') || fail 'lock has no checksum byte count'
-checksum_sha256=$(asset_field '.checksum.sha256') || fail 'lock has no checksum SHA-256'
-executable=$(asset_field '.installedExecutable') || fail 'lock has no installed executable name'
-
-require_basename "$archive_name" 'archive name'
-require_basename "$checksum_name" 'checksum name'
-require_basename "$archive_entry" 'archive entry'
-require_basename "$executable" 'installed executable'
-require_positive_decimal "$archive_size" 'archive size'
-require_positive_decimal "$checksum_size" 'checksum size'
-require_sha256 "$archive_sha256" 'locked archive SHA-256'
-require_sha256 "$checksum_sha256" 'locked checksum SHA-256'
-[ "$archive_entry" = "$executable" ] || fail 'lock archive entry and installed executable disagree'
-case "$archive_format" in tar.gz) ;; *) fail "unsupported Unix archive format: $archive_format" ;; esac
-case "$archive_url" in https://*) ;; *) fail 'archive URL must use HTTPS' ;; esac
-case "$checksum_url" in https://*) ;; *) fail 'checksum URL must use HTTPS' ;; esac
-
-runtime_dir="$repo_root/.runtime/cortiq"
-mkdir -p "$runtime_dir"
-[ -d "$runtime_dir" ] || fail 'runtime path is not a directory'
-[ ! -e "$runtime_dir/$executable" ] || fail "refusing to overwrite existing $runtime_dir/$executable"
-archive_path="$runtime_dir/$archive_name"
-checksum_path="$runtime_dir/$checksum_name"
-
-curl --fail --location --proto '=https' --proto-redir '=https' \
-  --output "$archive_path" "$archive_url"
-[ "$(file_size "$archive_path")" = "$archive_size" ] || fail 'downloaded archive size differs from lock'
-actual_archive_sha256=$(sha256_file "$archive_path") || fail 'could not hash downloaded archive'
-require_sha256 "$actual_archive_sha256" 'downloaded archive SHA-256'
-[ "$actual_archive_sha256" = "$archive_sha256" ] || fail 'downloaded archive SHA-256 differs from lock'
-
-curl --fail --location --proto '=https' --proto-redir '=https' \
-  --output "$checksum_path" "$checksum_url"
-[ "$(file_size "$checksum_path")" = "$checksum_size" ] || fail 'downloaded checksum size differs from lock'
-actual_checksum_sha256=$(sha256_file "$checksum_path") || fail 'could not hash downloaded checksum asset'
-require_sha256 "$actual_checksum_sha256" 'downloaded checksum asset SHA-256'
-[ "$actual_checksum_sha256" = "$checksum_sha256" ] || fail 'downloaded checksum asset SHA-256 differs from lock'
-
-checksum_fields=$(awk 'NR == 1 { fields = NF } END { if (NR != 1) exit 1; print fields }' "$checksum_path") || fail 'checksum asset must contain exactly one line'
-[ "$checksum_fields" = 2 ] || fail 'checksum asset must contain exactly a digest and file name'
-sidecar_archive_sha256=$(awk 'NR == 1 { print $1; exit }' "$checksum_path" | tr '[:upper:]' '[:lower:]')
-sidecar_archive_name=$(awk 'NR == 1 { name = $2; sub(/\r$/, "", name); print name; exit }' "$checksum_path")
-case "$sidecar_archive_name" in \*) sidecar_archive_name=${sidecar_archive_name#\*} ;; esac
-require_sha256 "$sidecar_archive_sha256" 'release checksum digest'
-[ "$sidecar_archive_name" = "$archive_name" ] || fail 'release checksum names a different archive'
-[ "$sidecar_archive_sha256" = "$archive_sha256" ] || fail 'release checksum disagrees with the lock'
-
-python3 "$verifier" --archive "$archive_path" --format "$archive_format" \
-  --entry "$executable" --extract-to "$runtime_dir"
-export OLLAMA_CORTIQ_PATH="$runtime_dir/$executable"
-test -x "$OLLAMA_CORTIQ_PATH"
-printf 'verified Cortiq runtime: %s\n' "$OLLAMA_CORTIQ_PATH"
+ollamacmf serve
 ```
 
-The lock currently has Unix artifacts for Linux `amd64`, macOS `amd64`, and
-macOS `arm64`. Linux `arm64` is deliberately rejected because the pinned CMF
-release has no reviewed runtime for that build target. See the
-[platform matrix](docs/cmf.md#platform-and-runtime-scope) for Windows and
-evidence boundaries.
-
-### 3. Start an isolated fork server
-
-Use a distinct port and model directory so the test cannot accidentally talk to
-an already-running official Ollama server or alter its model store.
+Chat with a model in another:
 
 ```sh
-export OLLAMA_HOST=127.0.0.1:11456
-export OLLAMA_MODELS="$(pwd)/.ollamacmf-models"
-"$OLLAMA_BIN" serve
+ollamacmf run hf.co/infosave/LFM2.5-cmf:lfm2.5-230m-q4tp
 ```
 
-Keep that terminal open. `OLLAMA_CORTIQ_PATH` is read by the server process, so
-set it **before** starting the server.
+The first run downloads the Cortiq runtime (about 16 MB) and the model (126 MB for this one), then opens an interactive chat. Type `/bye` to leave.
 
-### 4. Import the checked-in test fixture and call the Ollama API
-
-In a second terminal in the same checkout:
+Check that everything is in place at any time:
 
 ```sh
-export OLLAMA_BIN="$(pwd)/ollamacmf"
-export OLLAMA_HOST=127.0.0.1:11456
-fixture="$(pwd)/testdata/cmf/tiny-v0.8.19.cmf"
-printf 'FROM %s\nPARAMETER temperature 0\nPARAMETER num_predict 2\n' "$fixture" \
-  > /tmp/Modelfile.cmf
-
-"$OLLAMA_BIN" create cmf-smoke -f /tmp/Modelfile.cmf
-curl --fail --silent http://127.0.0.1:11456/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"cmf-smoke","messages":[{"role":"user","content":"Hello"}],"stream":false,"options":{"num_predict":2}}'
-printf '\n'
+ollamacmf cmf status
 ```
 
-The fixture is intentionally tiny with random weights: a successful response
-checks the integration contract, **not model quality**. Replace its absolute
-path in the Modelfile with a trusted, runnable CMF v2 generative text model for
-real use; see [obtaining a CMF model](docs/cmf.md#obtaining-a-cmf-model) for
-the separate upstream conversion/model guidance and its boundaries. To clean
-up, run `"$OLLAMA_BIN" rm cmf-smoke` while the server is
-still available, then stop the server and remove `.ollamacmf-models` and
-`.runtime` if they were created only for the smoke test.
+```text
+Server:    running at http://127.0.0.1:11434 (ollamacmf 0.1.0)
+Platform:  darwin/arm64
+Runtime:   Cortiq installed (0.8.19, managed)
+           /Users/you/.ollama/cortiq/v0.8.19/cortiq
+Expected:  Cortiq v0.8.19 in /Users/you/.ollama/cortiq
 
-For a Windows PowerShell flow, a real-model example, troubleshooting, and the
-full compatibility matrix, start with the [CMF/Cortiq guide](docs/cmf.md).
+CMF models:
+NAME                                          ARCH    PARAMS     QUANT       SIZE
+hf.co/infosave/LFM2.5-cmf:lfm2.5-230m-q4tp    lfm2    229.69M    q4_block    132 MB
+```
 
-## Compatibility and intentional boundaries
+## Models
 
-CMF is **not** a generic replacement for every Ollama feature. Current CMF
-models advertise completion capability only. The fork rejects embeddings,
-tokenization/detokenization, rendered templates, images/media, structured
-output, log probabilities, tool calls, and positive thinking requests rather
-than silently ignoring them. Model `PARAMETER` accepts only `temperature` and
-`num_predict`; request options are a deliberately smaller adapter surface than
-Cortiq's own HTTP API. See exact behavior and known resource limits in
-[CMF/Cortiq guide](docs/cmf.md#compatibility-and-limits).
+### Find models
 
-The registered-runtime path is also intentionally narrow:
+CMF models are published on Hugging Face under [huggingface.co/infosave](https://huggingface.co/infosave). List them from the command line:
 
-- A CMF model is imported locally from one absolute file; it is not pulled from
-  or pushed to a registry.
-- `OLLAMA_CORTIQ_PATH` must be an absolute executable path. The optional
-  `OLLAMA_CORTIQ_ALLOW_PATH=1` fallback is for local development only.
-- The current adapter has no reliable CMF GPU-memory accounting. CMF loading is
-  exclusive with other runners; in normal server flow the scheduler supplies
-  one slot, so `CMF_SERVE_SLOTS` is one unless an explicit positive value is
-  supplied.
+```sh
+ollamacmf cmf search            # everything
+ollamacmf cmf search granite    # filter by name
+```
 
-## Runtime intake and release policy
+See [docs/cmf-models.md](docs/cmf-models.md) for a curated list with sizes.
 
-[`Intake verified CMF runtime update`](.github/workflows/cmf-release-sync.yml)
-runs on a four-hour reconciliation schedule (`17 */4 * * *`) or a
-`cmf-release` repository dispatch. It validates a complete, bounded set of
-upstream release assets and checksums, then opens a create-only candidate branch
-and PR that change only `cmf.lock.json`.
+### Pull from Hugging Face
 
-That is **candidate intake, not automatic binary publishing**. The workflow
-never embeds Cortiq into an Ollama payload, publishes a Docker image, tags an
-`ollamacmf` release, or changes a `latest` release. A separate protected
-promotion/publishing pipeline is still required after human review, runtime
-E2E, license/provenance review, and platform signing/notarization. The
-[automation runbook](docs/cmf-release-automation.md) describes the exact
-current behavior and the required next gate without claiming an unimplemented
-release system.
+A repository is addressed as `hf.co/<account>/<repository>`. When it holds a single CMF file that is all you need:
 
-## Documentation map
+```sh
+ollamacmf pull hf.co/infosave/Bonsai-1.7Bcmf
+```
 
-| Document | Use it for |
+When it holds several variants, pick one with a tag. The tag is the file name without `.cmf`; a unique fragment of it works too:
+
+```sh
+ollamacmf pull hf.co/infosave/Granite-4.2-cmf:granite-4.2-3b-q4tp
+ollamacmf pull hf.co/infosave/Granite-4.2-cmf:8b-q4tp
+```
+
+If the tag is missing or ambiguous, `ollamacmf` lists the available files with their sizes and the exact command for each. Downloads resume if interrupted, and every file is checked against its SHA-256 before it is registered. Private or gated repositories work with `HF_TOKEN` set to a Hugging Face access token.
+
+### Use a local file
+
+Already have a `.cmf` file, for example one you converted with `cortiq convert`? Run it directly:
+
+```sh
+ollamacmf run ./granite-4.2-3b-q4tp.cmf
+```
+
+or register it under a name of your choice:
+
+```sh
+ollamacmf cmf import ./granite-4.2-3b-q4tp.cmf --name granite
+ollamacmf run granite
+```
+
+Only text generation models are accepted. Image, video, audio, embedding and decision CMF files are refused with a message that says what they are.
+
+### Manage models
+
+The usual Ollama commands apply:
+
+```sh
+ollamacmf list                 # installed models
+ollamacmf show granite         # architecture, parameters, context length, quantization, capabilities
+ollamacmf ps                   # loaded models
+ollamacmf stop granite         # unload now
+ollamacmf cp granite my-granite
+ollamacmf rm granite
+```
+
+### Customize with a Modelfile
+
+Derive a model with a system prompt or different defaults exactly as with any Ollama model:
+
+```text
+FROM hf.co/infosave/Granite-4.2-cmf:granite-4.2-3b-q4tp
+SYSTEM You are a concise assistant. Answer in one paragraph.
+PARAMETER temperature 0.3
+PARAMETER num_predict 512
+```
+
+```sh
+ollamacmf create concise-granite -f Modelfile
+```
+
+`FROM` can also point straight at a `.cmf` file. `TEMPLATE`, `RENDERER` and `PARSER` are not used: a CMF file carries its own chat template and tokenizer.
+
+## Use it from your apps
+
+`ollamacmf` serves the standard Ollama API and the OpenAI-compatible API, so existing clients work unchanged. Point them at `http://localhost:11434`.
+
+**Ollama API**
+
+```sh
+curl http://localhost:11434/api/chat -d '{
+  "model": "hf.co/infosave/Granite-4.2-cmf:granite-4.2-3b-q4tp",
+  "messages": [{"role": "user", "content": "Why is the sky blue?"}]
+}'
+```
+
+**OpenAI SDK**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+reply = client.chat.completions.create(
+    model="hf.co/infosave/Granite-4.2-cmf:granite-4.2-3b-q4tp",
+    messages=[{"role": "user", "content": "Why is the sky blue?"}],
+)
+print(reply.choices[0].message.content)
+```
+
+**Open WebUI, Continue, Zed, Cline and others** connect the same way they connect to Ollama. Use `ollamacmf list` to see the model names to enter.
+
+### What works
+
+| Feature | Status |
 | --- | --- |
-| [CMF/Cortiq guide](docs/cmf.md) | First install, import, requests, compatibility, security, and troubleshooting |
-| [CMF engine contract](docs/cmf-engine.md) | Maintainer-facing runner, lock, and packaging invariants |
-| [CMF release automation](docs/cmf-release-automation.md) | Candidate intake workflow and what it deliberately does not publish |
-| [Development guide](docs/development.md) | Native Ollama build prerequisites and CI |
-| [Base Ollama documentation](https://docs.ollama.com) | General upstream behavior; it does **not** document this CMF adapter |
+| Chat and generate, streaming | Yes |
+| Tool calling | Yes, when the model's chat template supports tools (`ollamacmf show` lists `tools`) |
+| Thinking / reasoning | Yes, when the model supports it (`ollamacmf show` lists `thinking`); `--think=false` turns it off |
+| `temperature`, `top_p`, `seed`, `num_predict`, `stop` | Yes |
+| `top_k`, `min_p`, repetition penalties, `num_ctx`, `num_gpu` | Accepted and ignored: Cortiq controls sampling and context itself |
+| Structured output (`format`), log probabilities | Not yet |
+| Images and audio input, embeddings | Not yet |
+| `ollamacmf push` to ollama.com | No. Share the `.cmf` file or publish it on Hugging Face |
 
-## Contributing, security, and upstream
+GGUF and safetensors models keep working exactly as in upstream Ollama when the corresponding native runners are built; a plain `go build` gives you a binary that serves CMF models only.
 
-Please report fork bugs and feature proposals in the
-[ollamacmf issue tracker](https://github.com/infosave2007/ollamacmf/issues) and
-read [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately using
-the [fork's GitHub Security Advisories](https://github.com/infosave2007/ollamacmf/security/advisories/new);
-do not send fork-specific reports to Ollama, Inc.
+## Configuration
 
-This project is distributed under the [MIT License](LICENSE) inherited from
-Ollama. The reviewed Cortiq runtime inputs and the test fixture are recorded as
-Apache-2.0 in [cmf.lock.json](cmf.lock.json). Keep the relevant third-party
-notices with any future runtime distribution.
+Everything has a sensible default. The variables below are read by `ollamacmf serve`.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `OLLAMA_HOST` | Address the server listens on | `127.0.0.1:11434` |
+| `OLLAMA_MODELS` | Where models are stored | `~/.ollama/models` |
+| `OLLAMA_KEEP_ALIVE` | How long a model stays loaded after the last request | `5m` |
+| `OLLAMA_CORTIQ_DIR` | Where the Cortiq runtime is installed | `cortiq` next to the models directory |
+| `OLLAMA_CORTIQ_PATH` | Use this Cortiq executable instead of the managed one | unset |
+| `OLLAMA_CORTIQ_AUTO_INSTALL` | Download the runtime automatically when missing (`0` to disable) | `1` |
+| `CMF_GPU` | `1` asks Cortiq for the GPU (Metal on Apple Silicon, Vulkan/DX12 elsewhere), `0` forces CPU | Cortiq's default |
+| `CMF_THREADS` | CPU threads for Cortiq | all cores |
+| `HF_TOKEN` | Hugging Face token for private or gated repositories | unset |
+
+Variables starting with `CMF_` are passed through to Cortiq; see the [Cortiq documentation](https://github.com/infosave2007/cmf) for the full list.
+
+### The Cortiq runtime
+
+`ollamacmf` is tested against one exact Cortiq release, recorded in [`cmfrunner/cmf.lock.json`](cmfrunner/cmf.lock.json) together with the SHA-256 of every build. On first use the server downloads that release for your platform, verifies the checksum and installs it under `~/.ollama/cortiq/<version>/`. Release archives ship the same runtime next to the binary, so an offline install needs no download.
+
+```sh
+ollamacmf cmf setup     # install the runtime now instead of on first use
+ollamacmf cmf status    # show which runtime is used and where it came from
+```
+
+Lookup order: `OLLAMA_CORTIQ_PATH`, the managed install, a `cortiq` binary next to `ollamacmf`, then `cortiq` on `PATH`. A runtime from `PATH` with a different version is used but reported in the server log.
+
+Supported platforms: macOS (Apple Silicon and Intel), Linux x86-64, Windows x86-64 and ARM64. Linux ARM64 has no published Cortiq build yet; build Cortiq from source there and set `OLLAMA_CORTIQ_PATH`.
+
+## Troubleshooting
+
+**`CMF runtime is not available`** — the server could not find or download Cortiq. Run `ollamacmf cmf status` to see why, then `ollamacmf cmf setup` to install it, or set `OLLAMA_CORTIQ_PATH` to a Cortiq executable. If the machine is offline, copy the archive named in `cmfrunner/cmf.lock.json` over and unpack it into the directory `cmf status` prints.
+
+**`the repository has several CMF files`** — add a tag to choose a file; the message lists them.
+
+**`this is a CMF image model`** (or audio, video, embedding, decision) — only text generation models run here. Use Cortiq directly for the others.
+
+**The answer stops early** — raise `num_predict` (in a Modelfile or the request options). Without it `ollamacmf` allows up to 32 768 tokens or the model's context, whichever is smaller.
+
+**Another Ollama is already running** — both use port 11434. Stop one, or start `ollamacmf` with `OLLAMA_HOST=127.0.0.1:11435 ollamacmf serve` and set the same `OLLAMA_HOST` in the terminal you use the client from.
+
+**`ollamacmf ps` shows `100% CPU`** — Cortiq decides device placement itself and does not report it back, so this column is not meaningful for CMF models. Check the server log for the backend Cortiq picked.
+
+Server logs go to the terminal that runs `ollamacmf serve`; add `OLLAMA_DEBUG=1` for more detail.
+
+## How it works
+
+```text
+ollamacmf CLI / Ollama API / OpenAI API
+                 │
+                 ▼
+          ollamacmf server          model store, scheduling, HTTP API
+                 │
+                 ▼
+     cmfrunner → cortiq serve       one Cortiq process per loaded model,
+                 │                  loopback only, started and stopped by the server
+                 ▼
+            model.cmf               weights, tokenizer and chat template in one file
+```
+
+Cortiq owns tokenization, the chat template, sampling and the context window; `ollamacmf` forwards chat and completion requests to it and translates the answers into the Ollama and OpenAI response formats. The Cortiq port is picked per process on `127.0.0.1` and is not meant to be used directly.
+
+## Documentation
+
+- [User guide](docs/cmf.md) — install, pull, import, configure, API, troubleshooting in more depth
+- [Model catalog](docs/cmf-models.md) — CMF models on Hugging Face with sizes and pull commands
+- [Maintainer notes](docs/cmf-engine.md) — how the adapter, the runtime lock and the release pipeline fit together
+- [Runtime updates](docs/cmf-release-automation.md) — how a new Cortiq release gets into the lock
+- [Development](docs/development.md) — building the native Ollama runners
+
+## Contributing and security
+
+Bug reports and ideas go to the [issue tracker](https://github.com/infosave2007/ollamacmf/issues); see [CONTRIBUTING.md](CONTRIBUTING.md). Please report security issues privately through [GitHub Security Advisories](https://github.com/infosave2007/ollamacmf/security/advisories/new) as described in [SECURITY.md](SECURITY.md).
+
+`ollamacmf` is an independent project and is not affiliated with Ollama, Inc. It is distributed under the [MIT License](LICENSE) inherited from Ollama. The bundled Cortiq runtime is licensed under Apache-2.0.

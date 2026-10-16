@@ -1,69 +1,41 @@
 # Contributing to ollamacmf
 
-Thank you for improving this experimental [Ollama](https://github.com/ollama/ollama)
-fork. `ollamacmf` adds a narrow local CMF/Cortiq runner while continuing to
-track upstream Ollama behavior where possible. It is maintained independently;
-please file fork-specific work in this repository, not in the upstream tracker.
+Thanks for helping improve `ollamacmf`. It is a fork of [Ollama](https://github.com/ollama/ollama) that adds support for CMF models through the Cortiq runtime, and it is maintained independently of Ollama, Inc. Please open fork-specific issues and pull requests in this repository, not upstream.
 
-## Before proposing a change
+## Before you start
 
-- Read the [CMF/Cortiq guide](./docs/cmf.md) for the public behavior and safety
-  boundary.
-- Read the [CMF engine contract](./docs/cmf-engine.md) before changing model
-  import, runner discovery, runtime packaging, or the canonical lock.
-- Use the [development guide](./docs/development.md) for native build and test
-  prerequisites.
-- Discuss a non-trivial feature or architecture change in an
-  [ollamacmf issue](https://github.com/infosave2007/ollamacmf/issues) first.
-  This is especially important for API surface, runtime distribution,
-  scheduler/resource behavior, or a new CMF platform target.
+- Read the [user guide](docs/cmf.md) to see how things are supposed to behave.
+- Read the [maintainer notes](docs/cmf-engine.md) if you plan to touch the adapter (`cmfrunner/`, `server/cmf_*.go`, `server/create.go`, `server/sched.go`) or the runtime lock.
+- For anything larger than a bug fix, open an issue first so the design can be discussed.
 
-Do not report security vulnerabilities in a public issue; follow
-[SECURITY.md](./SECURITY.md).
+## Building and testing
 
-## CMF-specific contribution rules
+```sh
+go build -o ollamacmf .
+go test ./cmfrunner ./server ./cmd
+```
 
-The current adapter is intentionally conservative. A change must not silently
-turn a rejected CMF request, Modelfile field, runtime lookup path, or platform
-into accepted behavior without documenting and testing it.
+`go build` alone produces a binary that serves CMF models. The native GGUF and safetensors runners are built as described in [docs/development.md](docs/development.md) and are not needed for CMF work.
 
-For CMF runtime or lock changes:
+To test against the real runtime, let the server install it (`./ollamacmf cmf setup`) and run a small model:
 
-1. Do not use `latest`, a mutable branch, an unpinned source build, or a
-   runtime for a different OS/architecture.
-2. Update only through the reviewed lock/fixture contract. Read
-   [CMF runtime intake automation](./docs/cmf-release-automation.md).
-3. Preserve the candidate-only promotion boundary: a lock update is not a
-   request to publish an installer or release artifact.
-4. Add or update tests for behavior, including the adapter E2E path when a
-   runtime or fixture changes.
-5. Keep the sidecar's trusted-single-user security limitation intact unless a
-   reviewed authenticated/private runner design replaces it.
+```sh
+./ollamacmf serve &
+./ollamacmf run hf.co/infosave/LFM2.5-cmf:lfm2.5-230m-q4tp "hello"
+```
+
+## Guidelines
+
+- Keep the user experience simple. A new option should have a sensible default, and an unsupported request option should be ignored (with a debug log) rather than rejected, unless ignoring it would silently produce wrong results.
+- Changes to what the adapter forwards to Cortiq need tests in `cmfrunner/client_test.go` and, for the HTTP layer, in `server/cmf_test.go`.
+- Changes to the runtime lock go through [runtime updates](docs/cmf-release-automation.md). Never point the lock at `latest` or at an archive for a different platform.
+- Keep upstream Ollama code changes minimal and separate from fork features where practical, so rebases onto upstream stay reviewable. Bugs in unmodified upstream code are best reported to [ollama/ollama](https://github.com/ollama/ollama) as well.
+- Document user-visible behaviour in the README and the user guide in the same pull request.
 
 ## Pull requests
 
-Keep pull requests focused and explain:
+Describe the problem, the user-visible change, and how you verified it. Use commit titles of the form `area: short description`, for example `cmfrunner: forward presence_penalty`.
 
-- the problem and user-visible behavior change;
-- why the change belongs in this fork rather than upstream Ollama or CMF;
-- API, compatibility, security, and platform implications; and
-- commands and results used to verify it.
+## Security
 
-Please include tests for code changes and documentation for changed public
-behavior. Do not claim packaging, platform support, or automatic publishing
-that the checked-in implementation does not provide.
-
-Use a concise commit title in the form:
-
-```text
-<area>: <short description>
-```
-
-For example: `cmfrunner: reject unsupported raw sampling option`.
-
-## Upstream work
-
-If a bug exists in unmodified upstream Ollama code, consider reporting it to
-[ollama/ollama](https://github.com/ollama/ollama) as well. Keep fork-specific
-changes separated from upstream fixes where practical so rebases remain
-reviewable.
+Do not report vulnerabilities in public issues; see [SECURITY.md](SECURITY.md).
